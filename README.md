@@ -20,6 +20,28 @@ Currently supported in practice:
 
 If your environment differs from that stack, assume it will need changes.
 
+## Real-World Example
+
+One real use case for this tool is automatically accepting a Dota 2 match when the acceptance dialog appears on screen.
+
+Sometimes the match is ready while I am away from the keyboard, distracted, or doing something else for a moment. Missing that accept window is more than just annoying in Dota 2, because failing to accept can lead to penalties or queue restrictions. That was the original motivation for this project.
+
+When the acceptance dialog appears:
+
+![Dota 2 accept dialog](./docs/images/dota2-accept-dialog.png)
+
+The app watches the selected monitor and tries to detect a cropped template such as:
+
+![Accept button template](./docs/images/dota2-accept-template.png)
+
+If that template appears on screen with enough confidence, the program automatically moves the mouse to the detected position and clicks it.
+
+That was the original use case, but the same idea can also work for other similar situations where:
+
+- a stable visual element appears on screen
+- that element should trigger a click
+- the UI is consistent enough for template matching to work reliably
+
 ## Clone And Setup
 
 1. Install Rust.
