@@ -1,4 +1,6 @@
-use crate::config::{validate_target_template_name, AppConfig, ConfigLoadError, ConfigStore, RuleConfig};
+use crate::config::{
+    validate_target_template_name, AppConfig, ConfigLoadError, ConfigStore, RuleConfig,
+};
 use crate::monitor::MonitorSpec;
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::{self, Write};
@@ -125,10 +127,7 @@ fn prompt_rules(io: &mut impl PromptIo) -> Result<Vec<RuleConfig>> {
     let mut rules = Vec::new();
 
     loop {
-        let prompt_label = format!(
-            "rule {}, target template (example.png)",
-            rules.len() + 1
-        );
+        let prompt_label = format!("rule {}, target template (example.png)", rules.len() + 1);
         let target_template = io.prompt(&prompt_label, None)?;
         validate_target_template_name(&target_template)
             .context("rule target template is invalid")?;

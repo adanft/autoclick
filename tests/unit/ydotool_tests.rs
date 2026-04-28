@@ -122,7 +122,7 @@ fn leaves_external_ydotoold_running_when_socket_is_already_ready() {
 }
 
 #[test]
-fn execute_click_falls_back_to_another_ready_socket_candidate() {
+fn execute_click_moves_with_hyprctl_and_falls_back_to_another_ready_socket_candidate() {
     let _guard = crate::support::lock_env();
     let dir = tempdir().unwrap();
     let bin_dir = dir.path().join("bin");
@@ -132,14 +132,19 @@ fn execute_click_falls_back_to_another_ready_socket_candidate() {
     fs::create_dir_all(&runtime_dir).unwrap();
     let active_socket = runtime_dir.join(".ydotool_socket");
     let socket_log = dir.path().join("socket.log");
+    let hyprctl_log = dir.path().join("hyprctl.log");
     let _listener = UnixDatagram::bind(&active_socket).unwrap();
 
     crate::support::write_executable_script(
         &bin_dir.join("ydotool"),
         &format!(
-            "#!/bin/sh\nprintf '%s\n' \"$YDOTOOL_SOCKET\" >> \"{}\"\nexit 0\n",
+            "#!/bin/sh\nprintf '%s %s\n' \"$YDOTOOL_SOCKET\" \"$*\" >> \"{}\"\nexit 0\n",
             socket_log.display()
         ),
+    );
+    crate::support::write_executable_script(
+        &bin_dir.join("hyprctl"),
+        &format!("#!/bin/sh\nprintf '%s\n' \"$*\" >> \"{}\"\nexit 0\n", hyprctl_log.display()),
     );
 
     let original_path = crate::support::capture_env("PATH");
@@ -168,9 +173,12 @@ fn execute_click_falls_back_to_another_ready_socket_candidate() {
     let logged = fs::read_to_string(&socket_log).unwrap();
     assert_eq!(
         logged.lines().collect::<Vec<_>>(),
-        vec![
-            active_socket.to_string_lossy(),
-            active_socket.to_string_lossy()
-        ]
+        vec![format!("{} click 0xC0", active_socket.to_string_lossy())]
+    );
+
+    let hyprctl_logged = fs::read_to_string(&hyprctl_log).unwrap();
+    assert_eq!(
+        hyprctl_logged.lines().collect::<Vec<_>>(),
+        vec!["dispatch movecursor 10 20"]
     );
 }

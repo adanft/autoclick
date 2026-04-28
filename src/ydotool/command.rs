@@ -16,21 +16,18 @@ pub(crate) fn verify_ydotool_binary() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run_mousemove(socket_path: &Path, x_value: &str, y_value: &str) -> Result<()> {
-    let args = ["mousemove", "--absolute", "-x", x_value, "-y", y_value];
-    let output = Command::new("ydotool")
-        .env("YDOTOOL_SOCKET", socket_path)
-        .args(args)
+pub(crate) fn run_hyprctl_movecursor(x_value: &str, y_value: &str) -> Result<()> {
+    let args = ["dispatch", "movecursor", x_value, y_value];
+    let output = Command::new("hyprctl")
+        .arg("dispatch")
+        .arg("movecursor")
+        .arg(x_value)
+        .arg(y_value)
         .output()
-        .context("failed to execute ydotool mousemove action")?;
+        .context("failed to execute hyprctl movecursor action")?;
 
     if !output.status.success() {
-        bail!(format_command_failure(
-            "ydotool mousemove",
-            &args,
-            socket_path,
-            &output,
-        ));
+        bail!(format_process_failure("hyprctl movecursor", &args, &output));
     }
 
     Ok(())
@@ -73,6 +70,24 @@ pub(crate) fn format_command_failure(
     format!(
         "{label} failed | socket={} | exit={} | args={} | stdout=`{}` | stderr=`{}`",
         socket_path.display(),
+        exit,
+        args.join(" "),
+        stdout,
+        stderr,
+    )
+}
+
+fn format_process_failure(label: &str, args: &[&str], output: &Output) -> String {
+    let exit = output
+        .status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "terminated by signal".to_string());
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    format!(
+        "{label} failed | exit={} | args={} | stdout=`{}` | stderr=`{}`",
         exit,
         args.join(" "),
         stdout,

@@ -76,13 +76,13 @@ impl YdotoolManager {
         })
     }
 
-    /// Executes an absolute mouse move followed by the Dota accept click.
+    /// Moves the cursor through Hyprland and executes the Dota accept click through `ydotool`.
     pub fn execute_click(&self, x: i32, y: i32) -> Result<()> {
         let socket_path = self.resolve_active_socket()?;
 
         let x_value = x.to_string();
         let y_value = y.to_string();
-        command::run_mousemove(&socket_path, &x_value, &y_value)?;
+        command::run_hyprctl_movecursor(&x_value, &y_value)?;
         command::run_ydotool(&socket_path, ["click", "0xC0"])?;
         Ok(())
     }

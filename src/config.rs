@@ -169,14 +169,9 @@ fn validate_config_schema(value: &Value) -> Result<()> {
         .as_object()
         .ok_or_else(|| anyhow!("config root must be a JSON object"))?;
 
-    let allowed: BTreeSet<&str> = [
-        "monitor_name",
-        "interval_ms",
-        "match_threshold",
-        "rules",
-    ]
-    .into_iter()
-    .collect();
+    let allowed: BTreeSet<&str> = ["monitor_name", "interval_ms", "match_threshold", "rules"]
+        .into_iter()
+        .collect();
 
     if object.contains_key("version") {
         bail!("config schema must not include a version field in v1");

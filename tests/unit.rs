@@ -213,7 +213,7 @@ mod ydotool {
 
             let x_value = x.to_string();
             let y_value = y.to_string();
-            command::run_mousemove(&socket_path, &x_value, &y_value)?;
+            command::run_hyprctl_movecursor(&x_value, &y_value)?;
             command::run_ydotool(&socket_path, ["click", "0xC0"])?;
             Ok(())
         }

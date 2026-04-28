@@ -1,6 +1,6 @@
 # autoclick
 
-Rust CLI that watches one Hyprland monitor, matches PNG templates with OpenCV, and triggers real mouse movement plus real clicks through `ydotool`.
+Rust CLI that watches one Hyprland monitor, matches PNG templates with OpenCV, moves the cursor through Hyprland, and triggers real clicks through `ydotool`.
 
 ## Warning
 
@@ -16,6 +16,7 @@ Currently supported in practice:
 - Wayland
 - Hyprland via `hyprctl`
 - screenshots via `grim`
+- cursor movement via `hyprctl dispatch movecursor`
 - click injection via `ydotool` / `ydotoold`
 
 If your environment differs from that stack, assume it will need changes.
