@@ -179,6 +179,6 @@ fn execute_click_moves_with_hyprctl_and_falls_back_to_another_ready_socket_candi
     let hyprctl_logged = fs::read_to_string(&hyprctl_log).unwrap();
     assert_eq!(
         hyprctl_logged.lines().collect::<Vec<_>>(),
-        vec!["dispatch movecursor 10 20"]
+        vec!["dispatch hl.dsp.cursor.move({ x = 10, y = 20 })"]
     );
 }

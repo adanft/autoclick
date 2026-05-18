@@ -17,17 +17,16 @@ pub(crate) fn verify_ydotool_binary() -> Result<()> {
 }
 
 pub(crate) fn run_hyprctl_movecursor(x_value: &str, y_value: &str) -> Result<()> {
-    let args = ["dispatch", "movecursor", x_value, y_value];
+    let cursor_dispatch = format!("hl.dsp.cursor.move({{ x = {x_value}, y = {y_value} }})");
+    let args = ["dispatch", cursor_dispatch.as_str()];
     let output = Command::new("hyprctl")
         .arg("dispatch")
-        .arg("movecursor")
-        .arg(x_value)
-        .arg(y_value)
+        .arg(&cursor_dispatch)
         .output()
-        .context("failed to execute hyprctl movecursor action")?;
+        .context("failed to execute hyprctl cursor move action")?;
 
     if !output.status.success() {
-        bail!(format_process_failure("hyprctl movecursor", &args, &output));
+        bail!(format_process_failure("hyprctl cursor move", &args, &output));
     }
 
     Ok(())

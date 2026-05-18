@@ -16,7 +16,7 @@ Currently supported in practice:
 - Wayland
 - Hyprland via `hyprctl`
 - screenshots via `grim`
-- cursor movement via `hyprctl dispatch movecursor`
+- cursor movement via Hyprland's `hyprctl dispatch` cursor API
 - click injection via `ydotool` / `ydotoold`
 
 If your environment differs from that stack, assume it will need changes.
