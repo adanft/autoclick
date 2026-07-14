@@ -100,6 +100,13 @@ mod monitor {
 
 mod wayland_pointer {
     include!("../src/wayland_pointer.rs");
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        include!("unit/wayland_pointer_tests.rs");
+    }
 }
 
 mod rules {
