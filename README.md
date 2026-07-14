@@ -48,10 +48,11 @@ That was the original use case, but the same idea can also work for other simila
 
 1. Install Rust.
 2. Install system binaries in `PATH`: `hyprctl`, `grim`.
-3. Run under the active Wayland session where the compositor advertises WLR virtual-pointer manager version 2 or later.
-4. Ensure the configured connector resolves to a complete, Normal-transform Wayland output and exactly one usable seat is present.
-5. Install OpenCV development libraries required by the Rust `opencv` crate.
-6. Make sure the build environment can resolve OpenCV and Clang tooling. Package names are distro-specific.
+3. Run from the active Hyprland session so `hyprctl`, `grim`, and the Wayland client can access that session. In practice, preserve its `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and Hyprland environment.
+4. Ensure Hyprland advertises `zwlr_virtual_pointer_manager_v1` version 2 or later and permits the client to use it.
+5. Ensure the configured connector resolves to exactly one complete, Normal-transform Wayland output and exactly one usable seat is present.
+6. Install OpenCV development libraries required by the Rust `opencv` crate.
+7. Make sure the build environment can resolve OpenCV and Clang tooling. Package names are distro-specific.
 
 This repository does not currently document distro-specific install commands because the required package names vary.
 
@@ -126,14 +127,28 @@ Current behavior:
 - best match per template
 - one temporary `capture.png` reused per scan cycle
 - runtime failures are surfaced by stage (`capture`, `OpenCV match`, `click execution`)
-- click injection requires the selected connector's Wayland virtual-pointer capability and fails closed when capability, seat, output, coordinates, or protocol delivery is invalid
+- one persistent, output-bound Wayland virtual pointer sends absolute motion, left-button press, and left-button release directly from the process
+- each click is a synchronous framed transaction on one Wayland connection; protocol round trips act as barriers so invalidation or delivery failures stop the transaction instead of falling back to another input path
+- click injection fails closed when capability, seat, output, coordinates, or protocol delivery is invalid
 - `hyprctl monitors -j` is used only to enumerate configured monitors; it is not an input, movement, timing, or cursor-confirmation path
+
+## Runtime Architecture
+
+The runtime uses three session-facing APIs:
+
+- `hyprctl monitors -j` discovers Hyprland monitor connector names and geometry for configuration
+- `grim` captures the selected connector for OpenCV template matching
+- `zwlr_virtual_pointer_v1` performs output-local pointer motion and clicking directly over Wayland
+
+The virtual pointer is created once during startup and remains bound to the selected Wayland output for the process lifetime. If the selected manager, seat, or output becomes invalid, the backend reports an error rather than rebinding or retrying a click.
 
 ## Development
 
 ```bash
 cargo test
 ```
+
+The test harness is rooted at `tests/unit.rs` and `tests/integration.rs`. Component tests live under `tests/unit/`, including the Wayland protocol and transaction coverage in `tests/unit/wayland_pointer_tests.rs`; they use an in-process test compositor/socket pair and do not inject input into the active desktop session.
 
 Known limitations:
 
