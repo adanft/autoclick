@@ -5,13 +5,16 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-opencv = { version = "0.98.2", default-features = false, features = ["clang-runtime", "imgcodecs", "imgproc"] }
+opencv = { version = "0.99.0", default-features = false, features = ["clang-runtime", "imgcodecs", "imgproc"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 signal-hook = "0.3"
 tempfile = "3.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+wayland-client = "0.31.14"
+wayland-protocols-wlr = { version = "0.3.12", features = ["client", "server"] }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+wayland-server = "0.31.11"

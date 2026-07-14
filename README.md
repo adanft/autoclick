@@ -1,6 +1,6 @@
 # autoclick
 
-Rust CLI that watches one Hyprland monitor, matches PNG templates with OpenCV, moves the cursor through Hyprland, and triggers real clicks through `ydotool`.
+Rust CLI that watches one configured Wayland output, matches PNG templates with OpenCV, and injects clicks through a persistent output-bound Wayland virtual pointer.
 
 ## Warning
 
@@ -14,10 +14,11 @@ Currently supported in practice:
 
 - Linux
 - Wayland
-- Hyprland via `hyprctl`
+- a Wayland compositor advertising WLR virtual-pointer manager version 2 or later
+- exactly one usable Wayland seat
+- a configured connector whose Wayland output reports a completed Normal transform
 - screenshots via `grim`
-- cursor movement via Hyprland's `hyprctl dispatch` cursor API
-- click injection via `ydotool` / `ydotoold`
+- `hyprctl monitors -j` only for configured-monitor enumeration
 
 If your environment differs from that stack, assume it will need changes.
 
@@ -35,7 +36,7 @@ The app watches the selected monitor and tries to detect a cropped template such
 
 ![Accept button template](./docs/images/dota2-accept-template.png)
 
-If that template appears on screen with enough confidence, the program automatically moves the mouse to the detected position and clicks it.
+If that template appears on screen with enough confidence, the program sends an output-local click through the configured output's Wayland virtual pointer.
 
 That was the original use case, but the same idea can also work for other similar situations where:
 
@@ -46,10 +47,11 @@ That was the original use case, but the same idea can also work for other simila
 ## Clone And Setup
 
 1. Install Rust.
-2. Install system binaries in `PATH`:
-   `hyprctl`, `grim`, `ydotool`, `ydotoold`.
-3. Install OpenCV development libraries required by the Rust `opencv` crate.
-4. Make sure the build environment can resolve OpenCV and Clang tooling. Package names are distro-specific.
+2. Install system binaries in `PATH`: `hyprctl`, `grim`.
+3. Run under the active Wayland session where the compositor advertises WLR virtual-pointer manager version 2 or later.
+4. Ensure the configured connector resolves to a complete, Normal-transform Wayland output and exactly one usable seat is present.
+5. Install OpenCV development libraries required by the Rust `opencv` crate.
+6. Make sure the build environment can resolve OpenCV and Clang tooling. Package names are distro-specific.
 
 This repository does not currently document distro-specific install commands because the required package names vary.
 
@@ -124,6 +126,8 @@ Current behavior:
 - best match per template
 - one temporary `capture.png` reused per scan cycle
 - runtime failures are surfaced by stage (`capture`, `OpenCV match`, `click execution`)
+- click injection requires the selected connector's Wayland virtual-pointer capability and fails closed when capability, seat, output, coordinates, or protocol delivery is invalid
+- `hyprctl monitors -j` is used only to enumerate configured monitors; it is not an input, movement, timing, or cursor-confirmation path
 
 ## Development
 

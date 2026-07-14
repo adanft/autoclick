@@ -2,7 +2,7 @@
 //!
 //! The runtime flow is intentionally split into small modules: discover
 //! monitors, capture a screenshot, run OpenCV template matching, evaluate the
-//! configured rules, and dispatch clicks through `ydotool`.
+//! configured rules, and dispatches clicks through an output-bound Wayland virtual pointer.
 
 use tracing_subscriber::EnvFilter;
 
@@ -14,7 +14,7 @@ pub mod matcher;
 pub mod monitor;
 pub mod rules;
 pub mod runtime;
-pub mod ydotool;
+pub mod wayland_pointer;
 
 /// Initializes stderr logging with `RUST_LOG`, defaulting to errors only.
 pub fn init_logging() {

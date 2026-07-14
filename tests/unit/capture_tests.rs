@@ -9,7 +9,7 @@ fn captures_full_selected_monitor_without_custom_rectangle_args() {
     crate::support::write_executable_script(
         &bin_dir.join("grim"),
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > \"{}\"\ntouch \"$3\"\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL9ZwAAAABJRU5ErkJggg==' | base64 -d > \"$3\"\n",
             args_path.display()
         ),
     );
@@ -31,13 +31,29 @@ fn captures_full_selected_monitor_without_custom_rectangle_args() {
         origin_y: 0,
     };
 
-    let screenshot = capture.capture_monitor(&monitor).unwrap();
+    let error = capture.capture_monitor(&monitor).unwrap_err();
+    assert!(error.to_string().contains("captured screenshot has no usable extent"));
     let args = fs::read_to_string(&args_path).unwrap();
     crate::support::restore_env("PATH", original_path);
 
     let arg_lines: Vec<&str> = args.lines().collect();
     assert_eq!(
         arg_lines,
-        vec!["-o", "HDMI-A-1", screenshot.to_string_lossy().as_ref()]
+        vec!["-o", "HDMI-A-1", args.lines().nth(2).unwrap()]
     );
+}
+
+#[test]
+fn records_only_positive_decoded_capture_extents() {
+    let image = CapturedImage::from_decoded("capture.png".into(), 2560, 1440).unwrap();
+
+    assert_eq!(image.path, std::path::PathBuf::from("capture.png"));
+    assert_eq!(
+        image.extent,
+        crate::wayland_pointer::ImageExtent {
+            width: 2560,
+            height: 1440,
+        }
+    );
+    assert!(CapturedImage::from_decoded("capture.png".into(), 0, 1440).is_err());
 }

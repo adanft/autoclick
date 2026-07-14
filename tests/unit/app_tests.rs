@@ -77,6 +77,38 @@ fn set_path(bin_dir: &std::path::Path) -> Option<std::ffi::OsString> {
 }
 
 #[test]
+fn runtime_input_contract_uses_only_wayland_pointer_and_monitor_enumeration() {
+    let executable_sources = [
+        include_str!("../../src/lib.rs"),
+        include_str!("../../src/runtime.rs"),
+        include_str!("../../src/app/bootstrap.rs"),
+        include_str!("../../Cargo.toml"),
+    ]
+    .join("\n");
+
+    for forbidden in [
+        "/dev/uinput",
+        "evdev",
+        "cursorpos",
+        "hl.dsp.cursor.move",
+        "wdotool",
+        "ydotool",
+        "external input automation",
+    ] {
+        assert!(
+            !executable_sources.contains(forbidden),
+            "runtime/bootstrap source must not retain {forbidden}"
+        );
+    }
+
+    let monitor_source = include_str!("../../src/monitor.rs");
+    assert!(monitor_source.contains("hyprctl"));
+    assert!(monitor_source.contains("monitors"));
+    assert!(!monitor_source.contains("cursorpos"));
+    assert!(!monitor_source.contains("dispatch"));
+}
+
+#[test]
 fn startup_summary_contains_key_runtime_fields() {
     let config = crate::config::AppConfig {
         monitor_name: "DP-1".to_string(),
@@ -101,7 +133,7 @@ fn startup_summary_contains_key_runtime_fields() {
         origin_y: 0,
     };
 
-    let rendered = render_startup_summary(&config, &prepared_rules, &monitor, true);
+    let rendered = render_startup_summary(&config, &prepared_rules, &monitor);
 
     assert!(rendered.contains("  Runtime"));
     assert!(rendered.contains("    * Monitor:   DP-1 · 1920x1080 @ (0, 0)"));
@@ -112,7 +144,7 @@ fn startup_summary_contains_key_runtime_fields() {
     assert!(rendered.contains("    1. accept_button.png"));
     assert!(rendered.contains("       - asset: /tmp/autoclick/templates/accept_button.png"));
     assert!(rendered.contains("       - size:  48x20"));
-    assert!(rendered.contains("    * Ydotoold:  managed"));
+    assert!(rendered.contains("    * Clicks:    persistent Wayland virtual pointer (selected connector; capability required; fail-closed)"));
     assert!(!rendered.contains("mode:"));
 }
 
@@ -141,7 +173,7 @@ fn startup_summary_omits_redundant_background_mode_copy() {
         origin_y: 0,
     };
 
-    let rendered = render_startup_summary(&config, &prepared_rules, &monitor, false);
+    let rendered = render_startup_summary(&config, &prepared_rules, &monitor);
 
     assert!(!rendered.contains("Background"));
     assert!(!rendered.contains("background monitoring starts automatically now"));
@@ -346,42 +378,14 @@ fn startup_fails_when_grim_dependency_is_missing() {
 }
 
 #[test]
-fn startup_fails_when_ydotool_dependency_is_missing() {
-    let _guard = crate::support::lock_env();
-    let dir = tempdir().unwrap();
-    let bin_dir = dir.path().join("bin");
-    fs::create_dir_all(&bin_dir).unwrap();
+fn startup_contextualizes_wayland_setup_failures_without_opening_a_device() {
+    let error = match create_wayland_backend_with("DP-1", |_| Err(anyhow!("selected output is unavailable"))) {
+        Ok(_) => panic!("backend unexpectedly connected"),
+        Err(error) => format!("{error:#}"),
+    };
 
-    crate::support::write_executable_script(
-        &bin_dir.join("grim"),
-        "#!/bin/sh\nif [ \"$1\" = \"-h\" ]; then exit 0; fi\nexit 1\n",
-    );
-
-    let config_path = dir.path().join("config.json");
-    let templates_dir = dir.path().join("templates");
-    fs::create_dir_all(&templates_dir).unwrap();
-    write_saved_config(
-        &config_path,
-        0.95,
-        "accept_button.png",
-    );
-    write_png(&templates_dir.join("accept_button.png"));
-
-    let original_path = set_path(&bin_dir);
-    let original_config = crate::support::capture_env("AUTOCLICK_CONFIG_PATH");
-    std::env::set_var("AUTOCLICK_CONFIG_PATH", &config_path);
-
-    let mut io = FakePromptIo::new(&["y"]);
-    let error = format!(
-        "{:#}",
-        run_with_io_and_monitors(&mut io, &sample_monitors()).unwrap_err()
-    );
-
-    crate::support::restore_env("PATH", original_path);
-    crate::support::restore_env("AUTOCLICK_CONFIG_PATH", original_config);
-
-    assert!(error.contains("ydotool dependency check failed"));
-    assert!(error.contains("failed to execute ydotool"));
+    assert!(error.contains("Wayland virtual-pointer setup failed"));
+    assert!(error.contains("selected output is unavailable"));
 }
 
 #[test]

@@ -1,12 +1,12 @@
-use crate::capture::CaptureService;
+use crate::capture::{CaptureService, CapturedImage};
 use crate::config::{AppConfig, RuleConfig};
 use crate::matcher::{self, MatchSet, PreparedRule};
 use crate::monitor::MonitorSpec;
-use crate::rules::{self, PlannedClick};
-use crate::ydotool::YdotoolManager;
+use crate::rules;
+use crate::wayland_pointer::{ClickExecutor, ImageExtent, PlannedClick};
 use anyhow::{Context, Error, Result};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -40,13 +40,15 @@ impl fmt::Display for RuntimeCycleError {
     }
 }
 
+impl std::error::Error for RuntimeCycleError {}
+
 /// Runs the background monitoring loop until the user requests shutdown.
 pub fn run_monitor_loop(
     config: &AppConfig,
     prepared_rules: &[PreparedRule],
     monitor: &MonitorSpec,
     capture: &CaptureService,
-    ydotool: &YdotoolManager,
+    executor: &mut impl ClickExecutor,
     shutdown_rx: Receiver<()>,
 ) -> Result<()> {
     run_monitor_loop_with_runner(config.interval_ms, shutdown_rx, || {
@@ -56,7 +58,7 @@ pub fn run_monitor_loop(
             config.match_threshold,
             monitor,
             capture,
-            ydotool,
+            executor,
         )
         .map(|_| ())
     })
@@ -79,6 +81,10 @@ where
         match run_cycle() {
             Ok(_) => {}
             Err(error) => {
+                if matches!(error, RuntimeCycleError::Click(_)) {
+                    return Err(error)
+                        .context("monitor loop stopped because click injection failed");
+                }
                 warn!(stage = error.stage_label(), error = %error, "cycle skipped after runtime failure");
             }
         }
@@ -103,7 +109,7 @@ pub(crate) fn run_cycle(
     match_threshold: f32,
     monitor: &MonitorSpec,
     capture: &CaptureService,
-    ydotool: &YdotoolManager,
+    executor: &mut impl ClickExecutor,
 ) -> std::result::Result<Vec<PlannedClick>, RuntimeCycleError> {
     run_cycle_with(
         rules_config,
@@ -116,11 +122,7 @@ pub(crate) fn run_cycle(
                 format!("OpenCV matching failed at threshold {:.2}", match_threshold)
             })
         },
-        |matches| {
-            execute_match_set(rules_config, monitor, matches, |x, y| {
-                ydotool.execute_click(x, y)
-            })
-        },
+        |matches, extent| execute_match_set(rules_config, extent, matches, executor),
     )
 }
 
@@ -134,15 +136,16 @@ fn run_cycle_with<C, M, E>(
     execute_cycle: E,
 ) -> std::result::Result<Vec<PlannedClick>, RuntimeCycleError>
 where
-    C: FnOnce() -> Result<PathBuf>,
+    C: FnOnce() -> Result<CapturedImage>,
     M: FnOnce(&Path, f32) -> Result<MatchSet>,
-    E: FnOnce(&MatchSet) -> Result<Vec<PlannedClick>>,
+    E: FnOnce(&MatchSet, ImageExtent) -> Result<Vec<PlannedClick>>,
 {
     let screenshot = capture_screenshot().map_err(RuntimeCycleError::Capture)?;
-    debug!(monitor = %monitor.name, screenshot = %screenshot.display(), "captured screenshot");
-    let matches = scan_matches(&screenshot, match_threshold).map_err(RuntimeCycleError::Match)?;
+    debug!(monitor = %monitor.name, screenshot = %screenshot.path.display(), "captured screenshot");
+    let matches =
+        scan_matches(&screenshot.path, match_threshold).map_err(RuntimeCycleError::Match)?;
     log_match_diagnostics(rules_config, prepared_rules, &matches, match_threshold);
-    execute_cycle(&matches).map_err(RuntimeCycleError::Click)
+    execute_cycle(&matches, screenshot.extent).map_err(RuntimeCycleError::Click)
 }
 
 fn log_match_diagnostics(
@@ -186,28 +189,26 @@ fn log_match_diagnostics(
     }
 }
 
-/// Converts accepted matches into click executions using the provided callback.
-pub fn execute_match_set<F>(
+/// Converts accepted matches into Wayland click executions.
+pub fn execute_match_set(
     rules_config: &[RuleConfig],
-    monitor: &MonitorSpec,
+    extent: ImageExtent,
     matches: &MatchSet,
-    mut execute_click: F,
-) -> Result<Vec<PlannedClick>>
-where
-    F: FnMut(i32, i32) -> Result<()>,
-{
-    let planned = rules::evaluate_rules(rules_config, matches, monitor);
+    executor: &mut impl ClickExecutor,
+) -> Result<Vec<PlannedClick>> {
+    let planned = rules::evaluate_rules(rules_config, matches, extent);
     for click in &planned {
         info!(
             rule_index = click.rule_index + 1,
             target_template = %click.target_template,
-            x = click.abs_x,
-            y = click.abs_y,
-            "executing planned click"
+            output_x = click.output_x,
+            output_y = click.output_y,
+            "executing planned Wayland click"
         );
-        execute_click(click.abs_x, click.abs_y)?;
-        info!(rule_index = click.rule_index + 1, "click executed");
+        executor
+            .click(click)
+            .context("Wayland virtual-pointer click failed")?;
+        info!(rule_index = click.rule_index + 1, target_template = %click.target_template, "Wayland click executed");
     }
-
     Ok(planned)
 }

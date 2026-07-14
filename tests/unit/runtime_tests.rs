@@ -13,9 +13,29 @@ fn match_failure(message: &'static str) -> RuntimeCycleError {
     RuntimeCycleError::Match(anyhow!(message))
 }
 
+fn click_failure(message: &'static str) -> RuntimeCycleError {
+    RuntimeCycleError::Click(anyhow!(message))
+}
+
+#[derive(Default)]
+struct RecordingExecutor {
+    clicks: Vec<crate::wayland_pointer::PlannedClick>,
+    failure: Option<anyhow::Error>,
+}
+
+impl crate::wayland_pointer::ClickExecutor for RecordingExecutor {
+    fn click(&mut self, click: &crate::wayland_pointer::PlannedClick) -> anyhow::Result<()> {
+        if let Some(error) = self.failure.take() {
+            return Err(error);
+        }
+        self.clicks.push(click.clone());
+        Ok(())
+    }
+}
+
 #[test]
 fn evaluates_multiple_rules_from_same_match_set_in_order() {
-    let monitor = crate::monitor::MonitorSpec {
+    let _monitor = crate::monitor::MonitorSpec {
         index: 1,
         name: "DP-1".to_string(),
         width: 1920,
@@ -52,7 +72,7 @@ fn evaluates_multiple_rules_from_same_match_set_in_order() {
         },
     ];
 
-    let planned = crate::rules::evaluate_rules(&rules, &matches, &monitor);
+    let planned = crate::rules::evaluate_rules(&rules, &matches, crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 });
 
     assert_eq!(planned.len(), 2);
     assert_eq!(planned[0].rule_index, 0);
@@ -92,6 +112,25 @@ fn continues_monitoring_after_transient_cycle_failure() {
 }
 
 #[test]
+fn stops_monitoring_after_click_injection_failure() {
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let calls = Arc::new(Mutex::new(0_usize));
+    let calls_for_runner = Arc::clone(&calls);
+
+    let error = run_monitor_loop_with_runner(1, rx, move || {
+        *calls_for_runner.lock().unwrap() += 1;
+        Err(click_failure("Wayland virtual pointer disconnected"))
+    })
+    .unwrap_err();
+
+    assert_eq!(*calls.lock().unwrap(), 1);
+    assert!(error
+        .to_string()
+        .contains("monitor loop stopped because click injection failed"));
+    assert!(format!("{error:#}").contains("Wayland virtual pointer disconnected"));
+}
+
+#[test]
 fn classifies_capture_failures_by_stage() {
     let monitor = crate::monitor::MonitorSpec {
         index: 1,
@@ -109,7 +148,7 @@ fn classifies_capture_failures_by_stage() {
         &monitor,
         || Err(anyhow!("grim missing")),
         |_, _| Ok(MatchSet::new()),
-        |_| Ok(Vec::new()),
+        |_, _| Ok(Vec::new()),
     )
     .unwrap_err();
 
@@ -133,9 +172,9 @@ fn classifies_match_failures_by_stage() {
         &[],
         0.95,
         &monitor,
-        || Ok(std::path::PathBuf::from("capture.png")),
+        || Ok(CapturedImage::from_decoded("capture.png".into(), 1920, 1080).unwrap()),
         |_, _| Err(anyhow!("OpenCV blew up")),
-        |_| Ok(Vec::new()),
+        |_, _| Ok(Vec::new()),
     )
     .unwrap_err();
 
@@ -159,14 +198,16 @@ fn classifies_click_failures_by_stage() {
         &[],
         0.95,
         &monitor,
-        || Ok(std::path::PathBuf::from("capture.png")),
+        || Ok(CapturedImage::from_decoded("capture.png".into(), 1920, 1080).unwrap()),
         |_, _| Ok(MatchSet::new()),
-        |_| Err(anyhow!("ydotool socket down")),
+        |_, _| Err(anyhow!("Wayland virtual pointer unavailable")),
     )
     .unwrap_err();
 
     assert_eq!(error.stage_label(), "click execution");
-    assert!(error.to_string().contains("ydotool socket down"));
+    assert!(error
+        .to_string()
+        .contains("Wayland virtual pointer unavailable"));
 }
 
 #[test]
@@ -210,14 +251,12 @@ fn run_cycle_reuses_single_capture_and_single_match_pass_for_all_rules() {
         prepared_rule("accept_button.png", "accept_button.png"),
         prepared_rule("ready_button.png", "ready_button.png"),
     ];
-    let clicks = Arc::new(Mutex::new(Vec::new()));
-    let clicks_for_executor = Arc::clone(&clicks);
     let capture_calls = Arc::new(Mutex::new(0_usize));
     let capture_calls_for_closure = Arc::clone(&capture_calls);
     let match_calls = Arc::new(Mutex::new(0_usize));
     let match_calls_for_closure = Arc::clone(&match_calls);
     let rules_for_execution = rules.clone();
-    let monitor_for_execution = monitor.clone();
+    let mut executor = RecordingExecutor::default();
 
     let planned = run_cycle_with(
         &rules,
@@ -226,7 +265,7 @@ fn run_cycle_reuses_single_capture_and_single_match_pass_for_all_rules() {
         &monitor,
         move || {
             *capture_calls_for_closure.lock().unwrap() += 1;
-            Ok(std::path::PathBuf::from("capture.png"))
+            Ok(CapturedImage::from_decoded("capture.png".into(), 1920, 1080).unwrap())
         },
         move |_, threshold| {
             *match_calls_for_closure.lock().unwrap() += 1;
@@ -252,16 +291,8 @@ fn run_cycle_reuses_single_capture_and_single_match_pass_for_all_rules() {
                 ),
             ]))
         },
-        move |matches| {
-            execute_match_set(
-                &rules_for_execution,
-                &monitor_for_execution,
-                matches,
-                move |x, y| {
-                    clicks_for_executor.lock().unwrap().push((x, y));
-                    Ok(())
-                },
-            )
+        |matches, extent| {
+            execute_match_set(&rules_for_execution, extent, matches, &mut executor)
         },
     )
     .unwrap();
@@ -269,64 +300,49 @@ fn run_cycle_reuses_single_capture_and_single_match_pass_for_all_rules() {
     assert_eq!(
         planned,
         vec![
-            crate::rules::PlannedClick {
+            crate::wayland_pointer::PlannedClick {
                 rule_index: 0,
                 target_template: "accept_button.png".to_string(),
-                abs_x: 120,
-                abs_y: 225,
+                output_x: 20,
+                output_y: 25,
+                extent: crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 },
             },
-            crate::rules::PlannedClick {
+            crate::wayland_pointer::PlannedClick {
                 rule_index: 1,
                 target_template: "ready_button.png".to_string(),
-                abs_x: 140,
-                abs_y: 245,
+                output_x: 40,
+                output_y: 45,
+                extent: crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 },
             },
         ]
     );
-    assert_eq!(*clicks.lock().unwrap(), vec![(120, 225), (140, 245)]);
+    assert_eq!(executor.clicks.len(), 2);
     assert_eq!(*capture_calls.lock().unwrap(), 1);
     assert_eq!(*match_calls.lock().unwrap(), 1);
 }
 
 #[test]
-fn execute_match_set_invokes_click_executor_with_planned_coordinates() {
-    let monitor = crate::monitor::MonitorSpec {
-        index: 1,
-        name: "DP-1".to_string(),
-        width: 1920,
-        height: 1080,
-        origin_x: 100,
-        origin_y: 200,
-    };
-    let rules = vec![crate::config::RuleConfig {
-        target_template: "accept_button.png".to_string(),
-    }];
-    let matches = MatchSet::from([(
-        "accept_button.png".to_string(),
-        vec![MatchRegion {
-            left: 10,
-            top: 20,
-            width: 20,
-            height: 10,
-        }],
-    )]);
-    let clicks = Arc::new(Mutex::new(Vec::new()));
-    let clicks_for_executor = Arc::clone(&clicks);
+fn execute_match_set_invokes_wayland_executor_with_output_local_plan() {
+    let rules = vec![crate::config::RuleConfig { target_template: "accept_button.png".to_string() }];
+    let matches = MatchSet::from([("accept_button.png".to_string(), vec![MatchRegion { left: 10, top: 20, width: 20, height: 10 }])]);
+    let mut executor = RecordingExecutor::default();
 
-    let planned = execute_match_set(&rules, &monitor, &matches, move |x, y| {
-        clicks_for_executor.lock().unwrap().push((x, y));
-        Ok(())
-    })
-    .unwrap();
+    let planned = execute_match_set(&rules, crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 }, &matches, &mut executor).unwrap();
 
-    assert_eq!(
-        planned,
-        vec![crate::rules::PlannedClick {
-            rule_index: 0,
-            target_template: "accept_button.png".to_string(),
-            abs_x: 120,
-            abs_y: 225,
-        }]
-    );
-    assert_eq!(*clicks.lock().unwrap(), vec![(120, 225)]);
+    assert_eq!(planned.len(), 1);
+    assert_eq!(executor.clicks, planned);
+    assert_eq!(executor.clicks[0].output_x, 20);
+    assert_eq!(executor.clicks[0].output_y, 25);
+    assert_eq!(executor.clicks[0].extent, crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 });
+    assert_ne!((executor.clicks[0].output_x, executor.clicks[0].output_y), (120, 225));
+}
+
+#[test]
+fn execute_match_set_surfaces_executor_failure() {
+    let rules = vec![crate::config::RuleConfig { target_template: "accept_button.png".to_string() }];
+    let matches = MatchSet::from([("accept_button.png".to_string(), vec![MatchRegion { left: 0, top: 0, width: 2, height: 2 }])]);
+    let mut executor = RecordingExecutor { clicks: Vec::new(), failure: Some(anyhow!("selected output was removed")) };
+
+    let error = execute_match_set(&rules, crate::wayland_pointer::ImageExtent { width: 2, height: 2 }, &matches, &mut executor).unwrap_err();
+    assert!(format!("{error:#}").contains("selected output was removed"));
 }

@@ -9,7 +9,6 @@ pub(crate) fn render_startup_summary(
     config: &AppConfig,
     prepared_rules: &[PreparedRule],
     monitor: &MonitorSpec,
-    ydotool_owned: bool,
 ) -> String {
     let mut lines = vec![
         "startup summary".to_string(),
@@ -21,10 +20,8 @@ pub(crate) fn render_startup_summary(
         format!("    * Interval:  {} ms", config.interval_ms),
         format!("    * Threshold: {:.2}", config.match_threshold),
         "    * Matcher:   OpenCV template matching".to_string(),
-        format!(
-            "    * Ydotoold:  {}",
-            if ydotool_owned { "managed" } else { "external" }
-        ),
+        "    * Clicks:    persistent Wayland virtual pointer (selected connector; capability required; fail-closed)"
+            .to_string(),
         String::new(),
         format!("  Rules ({})", config.rules.len()),
     ];

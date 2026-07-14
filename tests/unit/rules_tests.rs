@@ -47,7 +47,7 @@ fn ignores_rules_without_a_match() {
             target_template: "missing.png".to_string(),
         }],
         &match_set(),
-        &monitor(),
+        crate::wayland_pointer::ImageExtent { width: 2560, height: 1440 },
     );
 
     assert!(clicks.is_empty());
@@ -60,7 +60,7 @@ fn matches_target_template_when_region_exists() {
             target_template: "accept_button.png".to_string(),
         }],
         &match_set(),
-        &monitor(),
+        crate::wayland_pointer::ImageExtent { width: 2560, height: 1440 },
     );
 
     assert_eq!(clicks.len(), 1);
@@ -75,26 +75,20 @@ fn picks_first_matching_box_only_once_per_rule() {
             target_template: "ready_button.png".to_string(),
         }],
         &match_set(),
-        &monitor(),
+        crate::wayland_pointer::ImageExtent { width: 2560, height: 1440 },
     );
 
     assert_eq!(clicks.len(), 1);
-    assert_eq!(clicks[0].abs_x, 1920 + 400 + 40);
-    assert_eq!(clicks[0].abs_y, 335);
+        assert_eq!(clicks[0].output_x, 440);
+        assert_eq!(clicks[0].output_y, 335);
+        assert_eq!(
+            clicks[0].extent,
+            crate::wayland_pointer::ImageExtent { width: 2560, height: 1440 }
+        );
 }
 
 #[test]
-fn computes_center_point_from_monitor_origin() {
-    let monitor = monitor();
-    let point = plan_center_click(
-        &monitor,
-        &MatchRegion {
-            left: 50,
-            top: 60,
-            width: 101,
-            height: 41,
-        },
-    );
-
-    assert_eq!(point, (2020, 80));
+fn plans_only_output_local_centers_without_monitor_origin() {
+    let point = plan_center_click(&MatchRegion { left: 50, top: 60, width: 101, height: 41 });
+    assert_eq!(point, (100, 80));
 }

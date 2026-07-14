@@ -6,7 +6,7 @@ use crate::input;
 use crate::matcher::{self, PreparedRule};
 use crate::monitor::{self, MonitorSpec};
 use crate::runtime;
-use crate::ydotool::YdotoolManager;
+use crate::wayland_pointer::WaylandPointerBackend;
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use std::sync::mpsc;
@@ -41,28 +41,25 @@ pub(crate) fn run_with_io_and_monitors(
         &store.templates_dir(),
         matcher::prepare_rules,
     )?;
-    let mut ydotool = YdotoolManager::ensure_ready().context("ydotool dependency check failed")?;
+    let mut executor = create_wayland_backend_with(&monitor.name, WaylandPointerBackend::connect)?;
 
     print!(
         "{}",
-        render_startup_summary(&selected_config, &prepared_rules, &monitor, ydotool.owned())
+        render_startup_summary(&selected_config, &prepared_rules, &monitor)
     );
 
     println!("monitoring started (press `q` then Enter, or send SIGINT/SIGTERM to stop)");
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let _listener =
         input::spawn_stop_listener(shutdown_tx).context("failed to install shutdown listeners")?;
-    let runtime_result = runtime::run_monitor_loop(
+    runtime::run_monitor_loop(
         &selected_config,
         &prepared_rules,
         &monitor,
         &capture,
-        &ydotool,
+        &mut executor,
         shutdown_rx,
-    );
-
-    ydotool.shutdown()?;
-    runtime_result
+    )
 }
 
 /// Resolves the configured monitor name against the current monitor list.
@@ -72,6 +69,16 @@ fn resolve_configured_monitor(monitors: &[MonitorSpec], monitor_name: &str) -> R
         .find(|monitor| monitor.name == monitor_name)
         .cloned()
         .ok_or_else(|| anyhow!("configured monitor `{monitor_name}` is no longer available"))
+}
+
+pub(crate) fn create_wayland_backend_with<F>(
+    connector: &str,
+    connect: F,
+) -> Result<WaylandPointerBackend>
+where
+    F: FnOnce(&str) -> Result<WaylandPointerBackend>,
+{
+    connect(connector).context("Wayland virtual-pointer setup failed")
 }
 
 pub(crate) fn prepare_runtime_rules_with<F>(
