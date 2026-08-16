@@ -170,3 +170,17 @@ fn rejects_rule_target_template_with_absolute_path() {
     let error = format!("{:#}", parse_config(raw).unwrap_err());
     assert!(error.contains("must be a filename inside templates/"));
 }
+
+#[test]
+fn stamps_the_schema_version_onto_every_saved_config() {
+    let dir = tempdir().unwrap();
+    let store = ConfigStore::from_path(dir.path().join("config.json"));
+
+    store.save(&example_config()).unwrap();
+
+    let raw = std::fs::read_to_string(store.path()).unwrap();
+    let document: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    assert_eq!(document.get("version"), Some(&serde_json::json!(1)));
+    assert_eq!(store.load().unwrap(), example_config());
+}

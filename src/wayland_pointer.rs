@@ -280,10 +280,6 @@ mod protocol_substrate {
     pub(super) struct ProtocolSubstrate {
         connection: Connection,
         event_queue: EventQueue<AdapterState>,
-        /// Held for the connection's lifetime so the bound registry object stays
-        /// alive and keeps delivering global add/remove events to the queue.
-        #[allow(dead_code)]
-        registry: WlRegistry,
         state: AdapterState,
         pointer: Option<ZwlrVirtualPointerV1>,
     }
@@ -300,11 +296,13 @@ mod protocol_substrate {
             connector: &str,
         ) -> anyhow::Result<Self> {
             let event_queue = connection.new_event_queue();
-            let registry = connection.display().get_registry(&event_queue.handle(), ());
+            // The registry proxy is not retained: `wl_registry` has no destroy
+            // request and wayland-client implements no `Drop` for proxies, so the
+            // bound object and its dispatch registration outlive this handle.
+            connection.display().get_registry(&event_queue.handle(), ());
             let mut substrate = Self {
                 connection,
                 event_queue,
-                registry,
                 state: AdapterState::new(connector),
                 pointer: None,
             };

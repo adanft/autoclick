@@ -457,7 +457,7 @@
     }
 
     #[test]
-    fn generated_client_fails_before_requests_when_manager_is_removed_before_click() {
+    fn generated_client_fails_before_requests_and_closes_idempotently_after_manager_removal() {
         use std::{
             os::unix::net::UnixStream,
             sync::{mpsc, Arc},
@@ -578,6 +578,7 @@
                             ..
                         } => "press",
                         Button { .. } => "release",
+                        Destroy => "destroy",
                         _ => "unexpected",
                     }
                     .into(),
@@ -638,10 +639,17 @@
             .to_string()
             .contains("selected discovery object was invalidated"));
 
+        // `Drop for WaylandPointerBackend` calls `close` unconditionally, so closing
+        // must stay safe on this already-degraded connection and after an explicit
+        // close. Exactly one `destroy` reaches the server across both calls: the
+        // second finds the pointer already taken and emits nothing.
+        substrate.close().unwrap();
+        substrate.close().unwrap();
+
         command.send(Command::Stop).unwrap();
         assert_eq!(
             received.recv().unwrap(),
-            ["motion", "frame", "press", "frame", "release", "frame"]
+            ["motion", "frame", "press", "frame", "release", "frame", "destroy"]
         );
         server.join().unwrap();
     }

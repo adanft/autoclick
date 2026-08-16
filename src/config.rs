@@ -105,11 +105,26 @@ impl ConfigStore {
             })?;
         }
 
-        let content = serde_json::to_string_pretty(config)?;
+        let content = serde_json::to_string_pretty(&versioned_document(config)?)?;
         fs::write(&self.path, content)
             .with_context(|| format!("failed to write config file at {}", self.path.display()))?;
         Ok(())
     }
+}
+
+/// Stamps the schema version onto the document being written so every file this
+/// build produces can be told apart by a later one.
+///
+/// `AppConfig` deliberately has no version field: the version describes the file
+/// format, not the running configuration, and keeping it out of the struct means
+/// no caller has to supply one.
+fn versioned_document(config: &AppConfig) -> Result<Value> {
+    let mut document = serde_json::to_value(config)?;
+    document
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("serialized config must be a JSON object"))?
+        .insert("version".to_string(), Value::from(SUPPORTED_CONFIG_VERSION));
+    Ok(document)
 }
 
 /// Parses and validates a serialized configuration payload.
