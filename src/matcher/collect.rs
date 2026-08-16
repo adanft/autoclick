@@ -1,38 +1,45 @@
 use super::MatchRegion;
 use anyhow::Result;
-use opencv::core::Mat;
+use opencv::core::{self, Mat, Point};
 use opencv::prelude::*;
 
 /// Collects the highest-scoring match whose score meets or exceeds the configured threshold.
+///
+/// OpenCV's `minMaxLoc` scans row-major and only replaces the maximum on a strictly
+/// higher score, so tied scores resolve to the first candidate in scan order.
 pub(crate) fn collect_regions(
     result: &Mat,
     template_size: (u32, u32),
     threshold: f32,
 ) -> Result<Vec<MatchRegion>> {
-    let mut best_match: Option<(f32, MatchRegion)> = None;
-
-    for top in 0..result.rows() {
-        for left in 0..result.cols() {
-            let score = *result.at_2d::<f32>(top, left)?;
-            if score >= threshold {
-                let region = MatchRegion {
-                    left,
-                    top,
-                    width: template_size.0 as i32,
-                    height: template_size.1 as i32,
-                };
-
-                let should_replace = best_match
-                    .as_ref()
-                    .map(|(best_score, _)| score > *best_score)
-                    .unwrap_or(true);
-
-                if should_replace {
-                    best_match = Some((score, region));
-                }
-            }
-        }
+    if result.empty() {
+        return Ok(Vec::new());
     }
 
-    Ok(best_match.into_iter().map(|(_, region)| region).collect())
+    let mut best_score = 0.0_f64;
+    let mut best_location = Point::default();
+    core::min_max_loc(
+        result,
+        None,
+        Some(&mut best_score),
+        None,
+        Some(&mut best_location),
+        &core::no_array(),
+    )?;
+
+    // The score matrix is CV_32FC1, so widening both sides to f64 is exact.
+    // Keep the comparison in the `>=` direction: a NaN maximum must be rejected,
+    // and `NaN >= threshold` is false exactly like the element-wise filter this
+    // replaced. Testing `best_score < threshold` instead would accept it.
+    let accepted = best_score >= f64::from(threshold);
+    if !accepted {
+        return Ok(Vec::new());
+    }
+
+    Ok(vec![MatchRegion {
+        left: best_location.x,
+        top: best_location.y,
+        width: template_size.0 as i32,
+        height: template_size.1 as i32,
+    }])
 }

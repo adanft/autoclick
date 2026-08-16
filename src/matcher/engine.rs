@@ -66,6 +66,19 @@ pub(crate) fn load_grayscale_mat(path: &Path) -> Result<Mat> {
     Ok(mat)
 }
 
+/// Returns the standard deviation of a single-channel image's pixel values.
+pub(crate) fn template_stddev(mat: &Mat) -> Result<f64> {
+    let mut mean = Mat::default();
+    let mut stddev = Mat::default();
+    opencv::core::mean_std_dev(mat, &mut mean, &mut stddev, &opencv::core::no_array())
+        .context("OpenCV meanStdDev execution failed")?;
+
+    stddev
+        .at_2d::<f64>(0, 0)
+        .copied()
+        .context("OpenCV meanStdDev returned no deviation channel")
+}
+
 /// Returns image dimensions while rejecting empty or invalid matrices.
 pub(crate) fn mat_dimensions(mat: &Mat) -> Result<(u32, u32)> {
     let width = mat.cols();
@@ -79,13 +92,17 @@ pub(crate) fn mat_dimensions(mat: &Mat) -> Result<(u32, u32)> {
 }
 
 /// Executes OpenCV `matchTemplate` with the current normalized correlation mode.
+///
+/// `TM_CCOEFF_NORMED` subtracts the mean of both images before correlating, so a
+/// uniformly bright screen region cannot score high against an unrelated template
+/// the way it can under `TM_CCORR_NORMED`.
 fn run_match_template(screenshot: &Mat, template: &Mat) -> Result<Mat> {
     let mut result = Mat::default();
     imgproc::match_template(
         screenshot,
         template,
         &mut result,
-        imgproc::TM_CCORR_NORMED,
+        imgproc::TM_CCOEFF_NORMED,
         &Mat::default(),
     )
     .context("OpenCV matchTemplate execution failed")?;
