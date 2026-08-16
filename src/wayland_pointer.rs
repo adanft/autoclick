@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 
-/// Private generated-protocol boundary. It is deliberately not constructed by the runtime yet.
+/// Wayland protocol boundary: owns the connection, the event queue and the
+/// selected output-bound virtual pointer.
 mod protocol_substrate {
     use anyhow::Context;
     use wayland_client::{
@@ -11,12 +12,6 @@ mod protocol_substrate {
         zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
         zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
     };
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) struct ManagerGlobal {
-        pub(super) name: u32,
-        pub(super) advertised_version: u32,
-    }
 
     #[derive(Default)]
     pub(super) struct SelectedPointerLifecycle {
@@ -39,52 +34,6 @@ mod protocol_substrate {
         }
     }
 
-    #[derive(Default)]
-    pub(super) struct RegistryState {
-        pub(super) manager: Option<ManagerGlobal>,
-    }
-
-    impl RegistryState {
-        pub(super) fn record_global(&mut self, name: u32, interface: &str, version: u32) {
-            if interface == ZwlrVirtualPointerManagerV1::interface().name {
-                self.manager = Some(ManagerGlobal {
-                    name,
-                    advertised_version: version,
-                });
-            }
-        }
-    }
-
-    impl Dispatch<WlRegistry, ()> for RegistryState {
-        fn event(
-            state: &mut Self,
-            _: &WlRegistry,
-            event: wl_registry::Event,
-            _: &(),
-            _: &Connection,
-            _: &QueueHandle<Self>,
-        ) {
-            match event {
-                wl_registry::Event::Global {
-                    name,
-                    interface,
-                    version,
-                } => state.record_global(name, &interface, version),
-                wl_registry::Event::GlobalRemove { name }
-                    if state.manager.is_some_and(|manager| manager.name == name) =>
-                {
-                    state.manager = None;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    wayland_client::delegate_noop!(RegistryState: ignore WlSeat);
-    wayland_client::delegate_noop!(RegistryState: ignore WlOutput);
-    wayland_client::delegate_noop!(RegistryState: ignore ZwlrVirtualPointerManagerV1);
-    wayland_client::delegate_noop!(RegistryState: ignore ZwlrVirtualPointerV1);
-
     /// Callback-owned selected-object state. Proxy user data is a stable registry ID.
     pub(super) struct AdapterState {
         discovery: super::DiscoveryState,
@@ -95,7 +44,6 @@ mod protocol_substrate {
         lifecycle: SelectedPointerLifecycle,
     }
 
-    #[allow(dead_code)]
     impl AdapterState {
         pub(super) fn new(connector: &str) -> Self {
             Self {
@@ -157,6 +105,10 @@ mod protocol_substrate {
             self.discovery.reduce(super::DiscoveryEvent::OutputDone(id));
         }
 
+        /// The discovery state machine invalidates a selected output whose
+        /// metadata is withdrawn, but the `wl_output` dispatch below has no event
+        /// that reaches this yet, so only the lifecycle tests drive it.
+        #[allow(dead_code)]
         pub(super) fn output_metadata_lost(&mut self, id: u32) {
             self.discovery
                 .reduce(super::DiscoveryEvent::OutputMetadataLost(id));
@@ -241,7 +193,12 @@ mod protocol_substrate {
                     version,
                 } if interface == ZwlrVirtualPointerManagerV1::interface().name => {
                     state.manager_global(name, version);
-                    state.manager = Some(registry.bind(name, version.min(2), qh, ()));
+                    state.manager = Some(registry.bind(
+                        name,
+                        version.min(super::REQUIRED_MANAGER_VERSION),
+                        qh,
+                        (),
+                    ));
                 }
                 wl_registry::Event::Global {
                     name,
@@ -320,18 +277,18 @@ mod protocol_substrate {
     wayland_client::delegate_noop!(AdapterState: ignore ZwlrVirtualPointerV1);
 
     /// Owns the synchronous Wayland primitives without borrowing from itself.
-    #[allow(dead_code)]
     pub(super) struct ProtocolSubstrate {
         connection: Connection,
         event_queue: EventQueue<AdapterState>,
+        /// Held for the connection's lifetime so the bound registry object stays
+        /// alive and keeps delivering global add/remove events to the queue.
+        #[allow(dead_code)]
         registry: WlRegistry,
         state: AdapterState,
         pointer: Option<ZwlrVirtualPointerV1>,
     }
 
-    #[allow(dead_code)]
     impl ProtocolSubstrate {
-        pub(super) const MANAGER_VERSION: u32 = 2;
         pub(super) const LEFT_BUTTON: u32 = 0x110;
 
         pub(super) fn connect(connector: &str) -> anyhow::Result<Self> {
@@ -449,42 +406,6 @@ mod protocol_substrate {
             self.connection.flush()?;
             Ok(())
         }
-
-        pub(super) fn assert_generated_signatures() {
-            fn assert_proxy<P: Proxy>() {}
-            let _: fn(&Connection) -> EventQueue<AdapterState> = Connection::new_event_queue;
-            let _: fn(
-                &WlRegistry,
-                u32,
-                u32,
-                &QueueHandle<RegistryState>,
-                (),
-            ) -> ZwlrVirtualPointerManagerV1 = WlRegistry::bind;
-            let _: fn(&WlRegistry, u32, u32, &QueueHandle<RegistryState>, ()) -> WlSeat =
-                WlRegistry::bind;
-            let _: fn(&WlRegistry, u32, u32, &QueueHandle<RegistryState>, ()) -> WlOutput =
-                WlRegistry::bind;
-            assert_proxy::<WlRegistry>();
-            assert_proxy::<WlSeat>();
-            assert_proxy::<WlOutput>();
-            assert_proxy::<ZwlrVirtualPointerManagerV1>();
-            assert_proxy::<ZwlrVirtualPointerV1>();
-        }
-
-        pub(super) fn assert_pointer_request_signatures() {
-            use wayland_client::protocol::wl_pointer::ButtonState;
-            let _: fn(&ZwlrVirtualPointerV1, u32, u32, u32, u32, u32) =
-                ZwlrVirtualPointerV1::motion_absolute;
-            let _: fn(&ZwlrVirtualPointerV1) = ZwlrVirtualPointerV1::frame;
-            let _: fn(&ZwlrVirtualPointerV1, u32, u32, ButtonState) = ZwlrVirtualPointerV1::button;
-            let _: fn(&ZwlrVirtualPointerV1) = ZwlrVirtualPointerV1::destroy;
-            let _: fn(&ZwlrVirtualPointerManagerV1) = ZwlrVirtualPointerManagerV1::destroy;
-        }
-
-        pub(super) fn assert_owns_adapter_event_queue() {
-            fn assert_queue(_: &EventQueue<AdapterState>) {}
-            let _: fn(&ProtocolSubstrate) = |substrate| assert_queue(&substrate.event_queue);
-        }
     }
 
     impl super::VirtualPointerPort for &mut ProtocolSubstrate {
@@ -517,6 +438,10 @@ mod protocol_substrate {
     }
 }
 
+/// Lowest `zwlr_virtual_pointer_manager_v1` version carrying the output-bound
+/// constructor this backend needs.
+const REQUIRED_MANAGER_VERSION: u32 = 2;
+
 /// Dimensions of the image from which an output-local click was planned.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ImageExtent {
@@ -539,15 +464,13 @@ pub trait ClickExecutor {
     fn click(&mut self, click: &PlannedClick) -> Result<()>;
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ButtonState {
     Pressed,
     Released,
 }
 
-/// Semantic operations exposed by the future generated Wayland adapter.
-#[allow(dead_code)]
+/// Semantic operations the click transaction issues against the virtual pointer.
 trait VirtualPointerPort {
     fn motion_absolute(
         &mut self,
@@ -563,20 +486,17 @@ trait VirtualPointerPort {
     fn best_effort_release(&mut self, time_ms: u32) -> Result<()>;
 }
 
-#[allow(dead_code)]
 trait Clock {
     fn next_ms(&mut self) -> u32;
 }
 
-/// Isolated, inactive transaction core for a persistent virtual pointer.
-#[allow(dead_code)]
+/// One click as a transaction: move, press, release, each framed, then a barrier.
 struct ClickTransaction<P, C> {
     port: P,
     clock: C,
     previous_timestamp: Option<u32>,
 }
 
-#[allow(dead_code)]
 impl<P, C> ClickTransaction<P, C>
 where
     P: VirtualPointerPort,
@@ -622,6 +542,9 @@ where
         Ok(())
     }
 
+    /// Test seam: unwraps the port so a recording double can be inspected after
+    /// a transaction. The runtime keeps the port for the next click instead.
+    #[allow(dead_code)]
     fn into_port(self) -> P {
         self.port
     }
@@ -660,7 +583,6 @@ where
     }
 }
 
-#[allow(dead_code)]
 fn validate_click(click: &PlannedClick) -> Result<(u32, u32, u32, u32)> {
     if click.extent.width <= 0 || click.extent.height <= 0 {
         bail!(
@@ -694,14 +616,12 @@ fn validate_click(click: &PlannedClick) -> Result<(u32, u32, u32, u32)> {
     ))
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Transform {
     Normal,
     Rotated,
 }
 
-#[allow(dead_code)]
 enum DiscoveryEvent {
     ManagerAdvertised(u32),
     ManagerRemoved,
@@ -713,10 +633,11 @@ enum DiscoveryEvent {
     OutputTransform(u32, Transform),
     OutputDone(u32),
     OutputRemoved(u32),
+    /// See `AdapterState::output_metadata_lost`: reachable from tests only.
+    #[allow(dead_code)]
     OutputMetadataLost(u32),
 }
 
-#[allow(dead_code)]
 #[derive(Default)]
 struct OutputState {
     name: Option<String>,
@@ -726,7 +647,6 @@ struct OutputState {
     done: bool,
 }
 
-#[allow(dead_code)]
 struct DiscoveryState {
     connector: String,
     manager: Option<u32>,
@@ -738,7 +658,6 @@ struct DiscoveryState {
     invalidated: bool,
 }
 
-#[allow(dead_code)]
 impl DiscoveryState {
     fn new(connector: &str) -> Self {
         Self {
@@ -800,9 +719,9 @@ impl DiscoveryState {
             return Err("selected discovery object was invalidated".into());
         }
         let version = self.manager.ok_or("virtual-pointer manager is absent")?;
-        if version < 2 {
+        if version < REQUIRED_MANAGER_VERSION {
             return Err(format!(
-                "virtual-pointer manager version {version} is below v2"
+                "virtual-pointer manager version {version} is below v{REQUIRED_MANAGER_VERSION}"
             ));
         }
         if self.seats.len() != 1 {
@@ -858,7 +777,7 @@ impl Clock for WaylandClock {
     }
 }
 
-/// Inactive synchronous owner for the selected output-bound virtual pointer.
+/// Synchronous owner of the selected output-bound virtual pointer.
 pub struct WaylandPointerBackend {
     substrate: protocol_substrate::ProtocolSubstrate,
     started: std::time::Instant,
@@ -874,6 +793,16 @@ impl WaylandPointerBackend {
 
     pub fn close(&mut self) -> Result<()> {
         self.substrate.close()
+    }
+}
+
+impl Drop for WaylandPointerBackend {
+    /// Releases the virtual pointer on shutdown. `close` is idempotent, so an
+    /// explicit call before drop stays valid.
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            tracing::warn!(error = %error, "Wayland virtual-pointer cleanup failed during shutdown");
+        }
     }
 }
 

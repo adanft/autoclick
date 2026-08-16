@@ -9,6 +9,9 @@ use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
+/// Schema version this build reads. Configs may omit it, which means this value.
+const SUPPORTED_CONFIG_VERSION: u64 = 1;
+
 /// One template-matching rule stored in the persisted configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuleConfig {
@@ -169,13 +172,17 @@ fn validate_config_schema(value: &Value) -> Result<()> {
         .as_object()
         .ok_or_else(|| anyhow!("config root must be a JSON object"))?;
 
-    let allowed: BTreeSet<&str> = ["monitor_name", "interval_ms", "match_threshold", "rules"]
-        .into_iter()
-        .collect();
+    let allowed: BTreeSet<&str> = [
+        "version",
+        "monitor_name",
+        "interval_ms",
+        "match_threshold",
+        "rules",
+    ]
+    .into_iter()
+    .collect();
 
-    if object.contains_key("version") {
-        bail!("config schema must not include a version field in v1");
-    }
+    validate_config_version(object.get("version"))?;
 
     for key in object.keys() {
         if !allowed.contains(key.as_str()) {
@@ -213,6 +220,29 @@ fn validate_config_schema(value: &Value) -> Result<()> {
                 bail!("unsupported rule field at config.rules[{index}]: {key}");
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Accepts an optional schema version so a future format can be told apart from
+/// a corrupt one.
+///
+/// A config written by a newer build must fail with a message naming the version
+/// gap rather than an unrelated complaint about an unknown field.
+fn validate_config_version(version: Option<&Value>) -> Result<()> {
+    let Some(version) = version else {
+        return Ok(());
+    };
+
+    let version = version
+        .as_u64()
+        .ok_or_else(|| anyhow!("config.version must be a positive integer"))?;
+
+    if version != SUPPORTED_CONFIG_VERSION {
+        bail!(
+            "config.version {version} was written by a different build; this one reads version {SUPPORTED_CONFIG_VERSION}"
+        );
     }
 
     Ok(())

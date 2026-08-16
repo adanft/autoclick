@@ -8,7 +8,7 @@ use anyhow::{Context, Error, Result};
 use std::fmt;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 #[derive(Debug)]
@@ -72,12 +72,15 @@ fn run_monitor_loop_with_runner<F>(
 where
     F: FnMut() -> std::result::Result<(), RuntimeCycleError>,
 {
+    let interval = Duration::from_millis(interval_ms);
+
     loop {
         if shutdown_rx.try_recv().is_ok() {
             println!("shutdown requested");
             break;
         }
 
+        let cycle_started = Instant::now();
         match run_cycle() {
             Ok(_) => {}
             Err(error) => {
@@ -89,7 +92,11 @@ where
             }
         }
 
-        match shutdown_rx.recv_timeout(Duration::from_millis(interval_ms)) {
+        // Wait out only what is left of the interval. Sleeping the full interval
+        // after the cycle would make the real scan period `interval_ms` plus the
+        // capture and match time, which drifts further apart the slower a cycle is.
+        let remaining = interval.saturating_sub(cycle_started.elapsed());
+        match shutdown_rx.recv_timeout(remaining) {
             Ok(_) => {
                 println!("shutdown requested");
                 break;

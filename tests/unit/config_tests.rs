@@ -22,7 +22,7 @@ fn saves_and_loads_config() {
 }
 
 #[test]
-fn rejects_version_field() {
+fn accepts_the_supported_config_version() {
     let raw = r#"{
         "version": 1,
         "monitor_name": "DP-1",
@@ -31,8 +31,46 @@ fn rejects_version_field() {
         "rules": [{"target_template": "accept_button.png"}]
     }"#;
 
+    let config = parse_config(raw).unwrap();
+
+    assert_eq!(config.monitor_name, "DP-1");
+    assert_eq!(config.interval_ms, 200);
+}
+
+#[test]
+fn reports_a_config_written_by_a_different_build() {
+    let raw = r#"{
+        "version": 2,
+        "monitor_name": "DP-1",
+        "interval_ms": 200,
+        "match_threshold": 0.95,
+        "rules": [{"target_template": "accept_button.png"}]
+    }"#;
+
     let error = parse_config(raw).unwrap_err().to_string();
-    assert!(error.contains("must not include a version field"));
+
+    assert!(
+        error.contains("config.version 2 was written by a different build"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn rejects_a_non_integer_config_version() {
+    let raw = r#"{
+        "version": "one",
+        "monitor_name": "DP-1",
+        "interval_ms": 200,
+        "match_threshold": 0.95,
+        "rules": [{"target_template": "accept_button.png"}]
+    }"#;
+
+    let error = parse_config(raw).unwrap_err().to_string();
+
+    assert!(
+        error.contains("config.version must be a positive integer"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

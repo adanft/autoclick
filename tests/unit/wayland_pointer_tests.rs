@@ -1,4 +1,3 @@
-    use super::protocol_substrate::ProtocolSubstrate;
     use std::collections::VecDeque;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,38 +292,13 @@
     }
 
     #[test]
-    fn protocol_substrate_owns_an_adapter_event_queue_without_self_references() {
-        protocol_substrate::ProtocolSubstrate::assert_owns_adapter_event_queue();
-    }
-
-    #[test]
     fn protocol_substrate_confines_generated_types_without_a_socket() {
         use wayland_client::protocol::wl_registry::WlRegistry;
         use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
 
-        assert_eq!(ProtocolSubstrate::MANAGER_VERSION, 2);
+        assert_eq!(super::REQUIRED_MANAGER_VERSION, 2);
         let _: Option<WlRegistry> = None;
         let _: Option<ZwlrVirtualPointerManagerV1> = None;
-        ProtocolSubstrate::assert_generated_signatures();
-    }
-
-    #[test]
-    fn registry_substrate_retains_only_advertised_manager_capability_metadata() {
-        use wayland_client::{protocol::wl_seat::WlSeat, Proxy};
-        use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
-
-        let mut state = protocol_substrate::RegistryState::default();
-        state.record_global(3, WlSeat::interface().name, 8);
-        assert_eq!(state.manager, None);
-
-        state.record_global(9, ZwlrVirtualPointerManagerV1::interface().name, 4);
-        assert_eq!(
-            state.manager,
-            Some(protocol_substrate::ManagerGlobal {
-                name: 9,
-                advertised_version: 4,
-            })
-        );
     }
 
     #[test]
@@ -480,7 +454,6 @@
     #[test]
     fn generated_pointer_adapter_uses_left_button_and_exposes_barrier_and_close_signatures() {
         assert_eq!(protocol_substrate::ProtocolSubstrate::LEFT_BUTTON, 0x110);
-        protocol_substrate::ProtocolSubstrate::assert_pointer_request_signatures();
     }
 
     #[test]
