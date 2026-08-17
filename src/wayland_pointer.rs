@@ -330,13 +330,30 @@ mod protocol_substrate {
             Ok(substrate)
         }
 
-        fn before_request(&mut self) -> anyhow::Result<&ZwlrVirtualPointerV1> {
+        /// Dispatches queued compositor events and validates the selected pointer
+        /// once, before a transaction starts queueing requests.
+        ///
+        /// This is the only roundtrip a transaction pays on the way in; the
+        /// requests after it are queued and leave together at `barrier`.
+        pub(super) fn begin(&mut self) -> anyhow::Result<()> {
             let (event_queue, state) = (&mut self.event_queue, &mut self.state);
             semantic_request(
                 state,
                 |state| event_queue.roundtrip(state).map(|_| ()).map_err(Into::into),
                 || Ok(()),
-            )?;
+            )
+        }
+
+        /// Returns the pointer for a request that is only queued, never flushed.
+        ///
+        /// This runs the same full check as `begin`, discovery half included, and
+        /// still costs no compositor roundtrip: only the dispatch that normally
+        /// accompanies validation talks to the compositor. Keeping the discovery
+        /// half matters most after a failed `barrier`, which is the one moment the
+        /// selected seat, output or manager is already known gone — recovery must
+        /// refuse to write there rather than queue more requests.
+        fn queued_pointer(&mut self) -> anyhow::Result<&ZwlrVirtualPointerV1> {
+            self.state.validate().map_err(anyhow::Error::msg)?;
             self.pointer
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("selected virtual pointer is closed"))
@@ -350,13 +367,13 @@ mod protocol_substrate {
             width: u32,
             height: u32,
         ) -> anyhow::Result<()> {
-            self.before_request()?
+            self.queued_pointer()?
                 .motion_absolute(time, x, y, width, height);
             Ok(())
         }
 
         pub(super) fn frame(&mut self) -> anyhow::Result<()> {
-            self.before_request()?.frame();
+            self.queued_pointer()?.frame();
             Ok(())
         }
 
@@ -370,13 +387,15 @@ mod protocol_substrate {
                 super::ButtonState::Pressed => ButtonState::Pressed,
                 super::ButtonState::Released => ButtonState::Released,
             };
-            self.before_request()?
+            self.queued_pointer()?
                 .button(time, Self::LEFT_BUTTON, state);
             Ok(())
         }
 
+        /// Flushes the whole queued transaction in one write, then dispatches to
+        /// confirm the compositor did not invalidate the pointer meanwhile.
         pub(super) fn barrier(&mut self) -> anyhow::Result<()> {
-            self.before_request()?;
+            self.queued_pointer()?;
             self.connection.flush()?;
             let (event_queue, state) = (&mut self.event_queue, &mut self.state);
             semantic_barrier(
@@ -386,6 +405,13 @@ mod protocol_substrate {
             )
         }
 
+        /// Best-effort release after a transaction failed past the press.
+        ///
+        /// Both outcomes are deliberate. When the press itself failed while being
+        /// queued, returning early leaves it unwritten, which beats flushing a
+        /// press with no release behind it. When `barrier` failed after already
+        /// flushing the batch, `queued_pointer` refuses here too if the selected
+        /// objects are gone, so no request is written against a dead pointer.
         pub(super) fn best_effort_release(&mut self, time: u32) -> anyhow::Result<()> {
             self.left_button(time, super::ButtonState::Released)?;
             self.frame()?;
@@ -407,6 +433,10 @@ mod protocol_substrate {
     }
 
     impl super::VirtualPointerPort for &mut ProtocolSubstrate {
+        fn begin(&mut self) -> anyhow::Result<()> {
+            ProtocolSubstrate::begin(self)
+        }
+
         fn motion_absolute(
             &mut self,
             time: u32,
@@ -469,7 +499,11 @@ enum ButtonState {
 }
 
 /// Semantic operations the click transaction issues against the virtual pointer.
+///
+/// `begin` validates once; the requests after it are queued and leave the client
+/// in one write at `barrier`.
 trait VirtualPointerPort {
+    fn begin(&mut self) -> Result<()>;
     fn motion_absolute(
         &mut self,
         time_ms: u32,
@@ -510,6 +544,9 @@ where
 
     fn execute(&mut self, click: &PlannedClick) -> Result<()> {
         let (x, y, width, height) = validate_click(click)?;
+        self.port
+            .begin()
+            .map_err(|error| anyhow!("virtual-pointer transaction rejected: {error}"))?;
         let motion_time = self.next_timestamp()?;
         self.port
             .motion_absolute(motion_time, x, y, width, height)

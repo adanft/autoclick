@@ -2,6 +2,7 @@
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Event {
+        Begin,
         Motion(u32, u32, u32, u32, u32),
         Frame,
         Button(u32, ButtonState),
@@ -16,6 +17,11 @@
     }
 
     impl VirtualPointerPort for Recorder {
+        fn begin(&mut self) -> Result<()> {
+            self.events.push(Event::Begin);
+            fail_if(self.fail_at, "begin")
+        }
+
         fn motion_absolute(
             &mut self,
             time: u32,
@@ -131,6 +137,7 @@
         assert_eq!(
             transaction.into_port().events,
             vec![
+                Event::Begin,
                 Event::Motion(10, 9, 4, 10, 5),
                 Event::Frame,
                 Event::Button(11, ButtonState::Pressed),
@@ -161,7 +168,7 @@
         assert!(transaction.execute(&valid_click()).is_err());
         assert_eq!(
             transaction.into_port().events,
-            vec![Event::Motion(1, 9, 4, 10, 5)]
+            vec![Event::Begin, Event::Motion(1, 9, 4, 10, 5)]
         );
     }
 
@@ -670,6 +677,7 @@
         assert_eq!(
             port.events,
             vec![
+                Event::Begin,
                 Event::Motion(1, 9, 4, 10, 5),
                 Event::Frame,
                 Event::Button(2, ButtonState::Pressed),
@@ -680,4 +688,23 @@
                 Event::Cleanup(4),
             ]
         );
+    }
+
+    #[test]
+    fn rejected_begin_queues_no_request_at_all() {
+        let mut transaction = ClickTransaction::new(
+            Recorder {
+                fail_at: Some("begin"),
+                ..Recorder::default()
+            },
+            TestClock::new([1, 2, 3]),
+        );
+
+        let error = transaction.execute(&valid_click()).unwrap_err();
+
+        assert!(
+            error.to_string().contains("transaction rejected"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(transaction.into_port().events, vec![Event::Begin]);
     }
