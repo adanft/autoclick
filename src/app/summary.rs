@@ -27,8 +27,13 @@ pub(crate) fn render_startup_summary(
     ];
 
     for (index, rule) in config.rules.iter().enumerate() {
-        let prepared = &prepared_rules[index];
         lines.push(format!("    {}. {}", index + 1, rule.target_template));
+        // `prepare_rules` yields one entry per rule, but a startup summary is no
+        // place to panic if that ever stops holding.
+        let Some(prepared) = prepared_rules.get(index) else {
+            lines.push("       - asset: unavailable".to_string());
+            continue;
+        };
         lines.push(format!(
             "       - asset: {}",
             display_asset_path(&prepared.template_path)

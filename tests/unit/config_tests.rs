@@ -184,3 +184,21 @@ fn stamps_the_schema_version_onto_every_saved_config() {
     assert_eq!(document.get("version"), Some(&serde_json::json!(1)));
     assert_eq!(store.load().unwrap(), example_config());
 }
+
+#[test]
+fn saves_the_threshold_without_widening_it_to_f64() {
+    let dir = tempdir().unwrap();
+    let store = ConfigStore::from_path(dir.path().join("config.json"));
+
+    store.save(&example_config()).unwrap();
+    let raw = std::fs::read_to_string(store.path()).unwrap();
+
+    // Serializing through serde_json::Value would widen the f32 and write
+    // 0.949999988079071 into a file people hand-edit.
+    assert!(
+        raw.contains("\"match_threshold\": 0.95"),
+        "threshold was not written verbatim: {raw}"
+    );
+    assert!(raw.contains("\"version\": 1"), "{raw}");
+    assert_eq!(store.load().unwrap(), example_config());
+}

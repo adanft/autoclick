@@ -1,3 +1,7 @@
+fn capture_mat(width: i32, height: i32) -> Mat {
+    Mat::new_rows_cols_with_default(height, width, CV_8UC1, Scalar::all(0.0)).unwrap()
+}
+
 fn prepared_rule(target_template: &str, template_path: &str) -> PreparedRule {
     PreparedRule {
         target_template: target_template.to_string(),
@@ -172,7 +176,7 @@ fn classifies_match_failures_by_stage() {
         &[],
         0.95,
         &monitor,
-        || Ok(CapturedImage::from_decoded("capture.png".into(), 1920, 1080).unwrap()),
+        || Ok(CapturedImage::from_decoded("capture.png".into(), capture_mat(1920, 1080)).unwrap()),
         |_, _| Err(anyhow!("OpenCV blew up")),
         |_, _| Ok(Vec::new()),
     )
@@ -198,7 +202,7 @@ fn classifies_click_failures_by_stage() {
         &[],
         0.95,
         &monitor,
-        || Ok(CapturedImage::from_decoded("capture.png".into(), 1920, 1080).unwrap()),
+        || Ok(CapturedImage::from_decoded("capture.png".into(), capture_mat(1920, 1080)).unwrap()),
         |_, _| Ok(MatchSet::new()),
         |_, _| Err(anyhow!("Wayland virtual pointer unavailable")),
     )
@@ -265,7 +269,7 @@ fn run_cycle_reuses_single_capture_and_single_match_pass_for_all_rules() {
         &monitor,
         move || {
             *capture_calls_for_closure.lock().unwrap() += 1;
-            Ok(CapturedImage::from_decoded("capture.png".into(), 1920, 1080).unwrap())
+            Ok(CapturedImage::from_decoded("capture.png".into(), capture_mat(1920, 1080)).unwrap())
         },
         move |_, threshold| {
             *match_calls_for_closure.lock().unwrap() += 1;
@@ -345,4 +349,48 @@ fn execute_match_set_surfaces_executor_failure() {
 
     let error = execute_match_set(&rules, crate::wayland_pointer::ImageExtent { width: 2, height: 2 }, &matches, &mut executor).unwrap_err();
     assert!(format!("{error:#}").contains("selected output was removed"));
+}
+
+#[test]
+fn hands_the_decoded_screenshot_to_the_matcher_untouched() {
+    use opencv::prelude::{MatTrait, MatTraitConst};
+
+    // The capture decodes the screenshot once and the matcher reuses that exact
+    // matrix. Nothing else proves the pixels survive the handoff: every other
+    // test feeds the matcher through a closure that ignores the image.
+    let monitor = crate::monitor::MonitorSpec {
+        index: 1,
+        name: "DP-1".to_string(),
+        width: 1920,
+        height: 1080,
+        origin_x: 0,
+        origin_y: 0,
+    };
+    let mut screenshot = capture_mat(6, 4);
+    *screenshot.at_2d_mut::<u8>(3, 5).unwrap() = 231;
+
+    let seen = Arc::new(Mutex::new(None));
+    let seen_for_closure = Arc::clone(&seen);
+    let mut executor = RecordingExecutor::default();
+
+    run_cycle_with(
+        &[],
+        &[],
+        0.95,
+        &monitor,
+        move || Ok(CapturedImage::from_decoded("capture.png".into(), screenshot).unwrap()),
+        move |image, _| {
+            *seen_for_closure.lock().unwrap() = Some((
+                image.cols(),
+                image.rows(),
+                *image.at_2d::<u8>(3, 5).unwrap(),
+                *image.at_2d::<u8>(0, 0).unwrap(),
+            ));
+            Ok(MatchSet::new())
+        },
+        |matches, extent| execute_match_set(&[], extent, matches, &mut executor),
+    )
+    .unwrap();
+
+    assert_eq!(*seen.lock().unwrap(), Some((6, 4, 231, 0)));
 }

@@ -444,3 +444,26 @@ fn startup_reports_missing_opencv_support_as_structural_error() {
     assert!(error.contains("OpenCV/template validation failed"));
     assert!(error.contains("OpenCV support is missing"));
 }
+
+#[test]
+fn startup_summary_survives_a_short_prepared_rules_list() {
+    let config = crate::config::AppConfig {
+        monitor_name: "DP-1".to_string(),
+        interval_ms: 250,
+        match_threshold: 0.95,
+        rules: vec![
+            crate::config::RuleConfig {
+                target_template: "accept_button.png".to_string(),
+            },
+            crate::config::RuleConfig {
+                target_template: "ready_button.png".to_string(),
+            },
+        ],
+    };
+
+    let summary = render_startup_summary(&config, &[], &sample_monitors()[0]);
+
+    assert!(summary.contains("1. accept_button.png"), "{summary}");
+    assert!(summary.contains("2. ready_button.png"), "{summary}");
+    assert!(summary.contains("asset: unavailable"), "{summary}");
+}

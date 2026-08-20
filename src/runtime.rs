@@ -5,8 +5,8 @@ use crate::monitor::MonitorSpec;
 use crate::rules;
 use crate::wayland_pointer::{ClickExecutor, ImageExtent, PlannedClick};
 use anyhow::{Context, Error, Result};
+use opencv::core::Mat;
 use std::fmt;
-use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -144,13 +144,13 @@ fn run_cycle_with<C, M, E>(
 ) -> std::result::Result<Vec<PlannedClick>, RuntimeCycleError>
 where
     C: FnOnce() -> Result<CapturedImage>,
-    M: FnOnce(&Path, f32) -> Result<MatchSet>,
+    M: FnOnce(&Mat, f32) -> Result<MatchSet>,
     E: FnOnce(&MatchSet, ImageExtent) -> Result<Vec<PlannedClick>>,
 {
     let screenshot = capture_screenshot().map_err(RuntimeCycleError::Capture)?;
     debug!(monitor = %monitor.name, screenshot = %screenshot.path.display(), "captured screenshot");
     let matches =
-        scan_matches(&screenshot.path, match_threshold).map_err(RuntimeCycleError::Match)?;
+        scan_matches(&screenshot.image, match_threshold).map_err(RuntimeCycleError::Match)?;
     log_match_diagnostics(rules_config, prepared_rules, &matches, match_threshold);
     execute_cycle(&matches, screenshot.extent).map_err(RuntimeCycleError::Click)
 }

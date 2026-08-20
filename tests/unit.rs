@@ -9,6 +9,7 @@ mod capture {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use opencv::core::{Scalar, CV_8UC1};
         use std::fs;
 
         include!("unit/capture_tests.rs");

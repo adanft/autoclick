@@ -111,6 +111,7 @@ The process keeps running until you press `q` and then `Enter`, or send `SIGINT`
 
 ```json
 {
+  "version": 1,
   "monitor_name": "DP-1",
   "interval_ms": 250,
   "match_threshold": 0.95,
@@ -120,17 +121,40 @@ The process keeps running until you press `q` and then `Enter`, or send `SIGINT`
 }
 ```
 
+`version` is optional when reading: a file without it is treated as version 1.
+Every save writes it, so a config produced by a newer build is reported as a
+version mismatch instead of an unrelated unknown-field error.
+
 Current behavior:
 
 - one global threshold
 - one `target_template` per rule
 - best match per template
-- one temporary `capture.png` reused per scan cycle
+- one temporary `capture.png` reused per scan cycle, decoded once and handed to the matcher
+- templates of a single uniform color are rejected during startup: normalized matching scores every position of every screenshot at 1.0 against them, so the runtime would click the top-left corner forever
 - runtime failures are surfaced by stage (`capture`, `OpenCV match`, `click execution`)
 - one persistent, output-bound Wayland virtual pointer sends absolute motion, left-button press, and left-button release directly from the process
-- each click is a synchronous framed transaction on one Wayland connection; protocol round trips act as barriers so invalidation or delivery failures stop the transaction instead of falling back to another input path
+- each click is a synchronous framed transaction on one Wayland connection: it validates once on the way in, queues motion, press and release, and flushes them in a single write closed by one protocol round trip, so press and release reach the compositor together
+- invalidation or delivery failures stop the transaction instead of falling back to another input path
 - click injection fails closed when capability, seat, output, coordinates, or protocol delivery is invalid
 - `hyprctl monitors -j` is used only to enumerate configured monitors; it is not an input, movement, timing, or cursor-confirmation path
+
+## Match Threshold
+
+`match_threshold` is compared against a `TM_CCOEFF_NORMED` score. That mode
+subtracts the mean of both images before correlating, so a flat bright region of
+the screen cannot score high against an unrelated template.
+
+The number is not portable across matching modes. A threshold tuned against a
+different mode will not mean the same thing here, and the failure is silent: the
+template simply stops matching and no click happens, with no error. Run with
+`RUST_LOG=debug` to see the best score of every template on every cycle,
+including the ones that were rejected, and pick a threshold from what you
+actually observe:
+
+```
+DEBUG OpenCV matcher finished template scan target_template=accept_button.png score=0.87 threshold=0.95 candidates=0
+```
 
 ## Runtime Architecture
 

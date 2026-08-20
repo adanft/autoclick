@@ -112,19 +112,22 @@ fn reuses_prepared_template_assets_for_duplicate_rules() {
 fn rejects_matches_below_threshold() {
     let result = match_result(2, 2, &[0.79, 0.10, 0.60, 0.78]);
 
-    let matches = collect_regions(&result, (3, 2), 0.80).unwrap();
+    let scan = collect_regions(&result, (3, 2), 0.80).unwrap();
 
-    assert!(matches.is_empty());
+    assert!(scan.regions.is_empty());
+    // The rejected score is still reported: it is what tells an operator the
+    // threshold is set just above what the screen produces.
+    assert_eq!(scan.best_score, Some(0.79_f32 as f64));
 }
 
 #[test]
 fn accepts_matches_at_threshold() {
     let result = match_result(2, 2, &[0.79, 0.80, 0.60, 0.78]);
 
-    let matches = collect_regions(&result, (3, 2), 0.80).unwrap();
+    let scan = collect_regions(&result, (3, 2), 0.80).unwrap();
 
     assert_eq!(
-        matches,
+        scan.regions,
         vec![MatchRegion {
             left: 1,
             top: 0,
@@ -132,6 +135,7 @@ fn accepts_matches_at_threshold() {
             height: 2,
         }]
     );
+    assert_eq!(scan.best_score, Some(0.80_f32 as f64));
 }
 
 #[test]
@@ -161,7 +165,8 @@ fn scan_all_runs_opencv_matching_for_identical_template() {
     )
     .unwrap();
 
-    let matches = scan_all(&screenshot_path, &prepared, 1.0).unwrap();
+    let screenshot_mat = load_grayscale_mat(&screenshot_path).unwrap();
+    let matches = scan_all(&screenshot_mat, &prepared, 1.0).unwrap();
 
     assert_eq!(
         matches.get("accept_button.png").unwrap().first(),
@@ -171,6 +176,63 @@ fn scan_all_runs_opencv_matching_for_identical_template() {
             width: 2,
             height: 2,
         })
+    );
+}
+
+/// Reads the `score` field out of a captured `tracing` line.
+fn logged_score(logs: &str) -> f64 {
+    let tail = logs
+        .split("score=")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no score was logged: {logs}"));
+    tail.chars()
+        .take_while(|character| !character.is_whitespace())
+        .collect::<String>()
+        .parse()
+        .unwrap_or_else(|error| panic!("score was not a number: {error}: {logs}"))
+}
+
+#[test]
+fn logs_the_best_score_of_a_template_it_rejected() {
+    // The README tells operators to tune `match_threshold` from what
+    // `RUST_LOG=debug` reports. That only works if a rejected template still
+    // reports how close it came, which is the whole point of tuning.
+    let dir = tempdir().unwrap();
+    let screenshot_path = dir.path().join("screen.png");
+    let template_path = dir.path().join("accept_button.png");
+
+    let mut screenshot = RgbaImage::from_pixel(5, 4, Rgba([0, 0, 0, 255]));
+    let mut template = RgbaImage::from_pixel(2, 2, Rgba([255, 255, 255, 255]));
+    template.put_pixel(1, 1, Rgba([0, 255, 0, 255]));
+    for y in 0..2 {
+        for x in 0..2 {
+            screenshot.put_pixel(1 + x, 1 + y, *template.get_pixel(x, y));
+        }
+    }
+
+    write_png(&screenshot_path, &screenshot);
+    write_png(&template_path, &template);
+
+    let prepared = prepare_rules(
+        &[crate::config::RuleConfig {
+            target_template: "accept_button.png".to_string(),
+        }],
+        dir.path(),
+    )
+    .unwrap();
+    let screenshot_mat = load_grayscale_mat(&screenshot_path).unwrap();
+
+    let mut matches = MatchSet::new();
+    let logs = crate::support::capture_debug_logs(|| {
+        // No score can reach 1.5, so the exact match on screen is rejected.
+        matches = scan_all(&screenshot_mat, &prepared, 1.5).unwrap();
+    });
+
+    assert_eq!(matches.get("accept_button.png"), Some(&Vec::new()));
+    let score = logged_score(&logs);
+    assert!(
+        score > 0.99 && score <= 1.0,
+        "an exact match should score ~1.0, logged {score}: {logs}"
     );
 }
 
@@ -184,7 +246,7 @@ fn returns_only_the_best_match_above_threshold() {
         ],
     );
 
-    let matches = collect_regions(&result, (2, 2), 0.95).unwrap();
+    let matches = collect_regions(&result, (2, 2), 0.95).unwrap().regions;
 
     assert_eq!(
         matches,
@@ -201,7 +263,7 @@ fn returns_only_the_best_match_above_threshold() {
 fn prefers_later_higher_score_over_earlier_threshold_match() {
     let result = match_result(1, 3, &[0.95, 0.10, 0.99]);
 
-    let matches = collect_regions(&result, (2, 2), 0.90).unwrap();
+    let matches = collect_regions(&result, (2, 2), 0.90).unwrap().regions;
 
     assert_eq!(
         matches,
@@ -216,9 +278,11 @@ fn prefers_later_higher_score_over_earlier_threshold_match() {
 
 #[test]
 fn returns_no_candidates_for_an_empty_score_matrix() {
-    let matches = collect_regions(&Mat::default(), (2, 2), 0.50).unwrap();
+    let scan = collect_regions(&Mat::default(), (2, 2), 0.50).unwrap();
 
-    assert!(matches.is_empty());
+    assert!(scan.regions.is_empty());
+    // Nothing was scored, so there is no score to report.
+    assert_eq!(scan.best_score, None);
 }
 
 #[test]
@@ -247,7 +311,8 @@ fn rejects_a_uniformly_bright_region_that_does_not_contain_the_template() {
     )
     .unwrap();
 
-    let matches = scan_all(&screenshot_path, &prepared, 0.90).unwrap();
+    let screenshot_mat = load_grayscale_mat(&screenshot_path).unwrap();
+    let matches = scan_all(&screenshot_mat, &prepared, 0.90).unwrap();
 
     assert_eq!(matches.get("accept_button.png"), Some(&Vec::new()));
 }
@@ -260,9 +325,13 @@ fn rejects_a_nan_maximum_instead_of_clicking_its_location() {
     let all_nan = match_result(1, 3, &[f32::NAN, f32::NAN, f32::NAN]);
     let leading_nan = match_result(1, 3, &[f32::NAN, 0.97, 0.10]);
 
-    assert!(collect_regions(&all_nan, (2, 2), 0.90).unwrap().is_empty());
+    assert!(collect_regions(&all_nan, (2, 2), 0.90)
+        .unwrap()
+        .regions
+        .is_empty());
     assert!(collect_regions(&leading_nan, (2, 2), 0.90)
         .unwrap()
+        .regions
         .is_empty());
 }
 

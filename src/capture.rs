@@ -1,6 +1,7 @@
 use crate::monitor::MonitorSpec;
 use crate::wayland_pointer::ImageExtent;
 use anyhow::{anyhow, bail, Context, Result};
+use opencv::core::Mat;
 use opencv::imgcodecs;
 use opencv::prelude::*;
 use std::path::{Path, PathBuf};
@@ -8,20 +9,27 @@ use std::process::Command;
 use tempfile::TempDir;
 
 /// A screenshot proven to have positive dimensions by the decoder used at the capture seam.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The decoded matrix travels with the capture so the matcher can reuse it. Reading
+/// the dimensions used to mean decoding the PNG once here and once again in the
+/// matcher, which is a full-screen decode wasted on every cycle.
+#[derive(Debug)]
 pub struct CapturedImage {
     pub path: PathBuf,
     pub extent: ImageExtent,
+    pub image: Mat,
 }
 
 impl CapturedImage {
-    pub fn from_decoded(path: PathBuf, width: i32, height: i32) -> Result<Self> {
+    pub fn from_decoded(path: PathBuf, image: Mat) -> Result<Self> {
+        let (width, height) = (image.cols(), image.rows());
         if width <= 0 || height <= 0 {
             bail!("captured image extent must be positive, got {width}x{height}");
         }
         Ok(Self {
             path,
             extent: ImageExtent { width, height },
+            image,
         })
     }
 }
@@ -80,7 +88,7 @@ impl CaptureService {
 
         let decoded = imgcodecs::imread(&path.to_string_lossy(), imgcodecs::IMREAD_GRAYSCALE)
             .with_context(|| format!("failed to decode captured screenshot {}", path.display()))?;
-        CapturedImage::from_decoded(path, decoded.cols(), decoded.rows())
+        CapturedImage::from_decoded(path, decoded)
             .context("captured screenshot has no usable extent")
     }
 }

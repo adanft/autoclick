@@ -1,3 +1,7 @@
+fn gray_mat(width: i32, height: i32) -> Mat {
+    Mat::new_rows_cols_with_default(height, width, CV_8UC1, Scalar::all(0.0)).unwrap()
+}
+
 #[test]
 fn captures_full_selected_monitor_without_custom_rectangle_args() {
     let _guard = crate::support::lock_env();
@@ -45,7 +49,7 @@ fn captures_full_selected_monitor_without_custom_rectangle_args() {
 
 #[test]
 fn records_only_positive_decoded_capture_extents() {
-    let image = CapturedImage::from_decoded("capture.png".into(), 2560, 1440).unwrap();
+    let image = CapturedImage::from_decoded("capture.png".into(), gray_mat(2560, 1440)).unwrap();
 
     assert_eq!(image.path, std::path::PathBuf::from("capture.png"));
     assert_eq!(
@@ -55,5 +59,5 @@ fn records_only_positive_decoded_capture_extents() {
             height: 1440,
         }
     );
-    assert!(CapturedImage::from_decoded("capture.png".into(), 0, 1440).is_err());
+    assert!(CapturedImage::from_decoded("capture.png".into(), Mat::default()).is_err());
 }

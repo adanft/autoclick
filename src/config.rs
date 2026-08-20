@@ -105,7 +105,10 @@ impl ConfigStore {
             })?;
         }
 
-        let content = serde_json::to_string_pretty(&versioned_document(config)?)?;
+        let content = serde_json::to_string_pretty(&ConfigDocument {
+            version: SUPPORTED_CONFIG_VERSION,
+            config,
+        })?;
         fs::write(&self.path, content)
             .with_context(|| format!("failed to write config file at {}", self.path.display()))?;
         Ok(())
@@ -118,13 +121,15 @@ impl ConfigStore {
 /// `AppConfig` deliberately has no version field: the version describes the file
 /// format, not the running configuration, and keeping it out of the struct means
 /// no caller has to supply one.
-fn versioned_document(config: &AppConfig) -> Result<Value> {
-    let mut document = serde_json::to_value(config)?;
-    document
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("serialized config must be a JSON object"))?
-        .insert("version".to_string(), Value::from(SUPPORTED_CONFIG_VERSION));
-    Ok(document)
+///
+/// Flattening writes straight through the JSON serializer. Building a
+/// `serde_json::Value` instead would widen `match_threshold` from `f32` to `f64`
+/// and render `0.95` as `0.949999988079071`.
+#[derive(Serialize)]
+struct ConfigDocument<'a> {
+    version: u64,
+    #[serde(flatten)]
+    config: &'a AppConfig,
 }
 
 /// Parses and validates a serialized configuration payload.

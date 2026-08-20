@@ -1,4 +1,4 @@
-use super::collect::collect_regions;
+use super::collect::{collect_regions, TemplateScan};
 use super::{MatchSet, PreparedRule};
 use anyhow::{bail, Context, Result};
 use opencv::core::Mat;
@@ -10,9 +10,7 @@ use tracing::debug;
 ///
 /// The returned regions contain only the single best candidate that meets the
 /// threshold for each template.
-pub fn scan_all(screenshot: &Path, rules: &[PreparedRule], threshold: f32) -> Result<MatchSet> {
-    let screenshot_mat = load_grayscale_mat(screenshot)
-        .with_context(|| format!("failed to decode screenshot {}", screenshot.display()))?;
+pub fn scan_all(screenshot_mat: &Mat, rules: &[PreparedRule], threshold: f32) -> Result<MatchSet> {
     let mut matches = MatchSet::new();
 
     for rule in rules {
@@ -30,24 +28,29 @@ pub fn scan_all(screenshot: &Path, rules: &[PreparedRule], threshold: f32) -> Re
             "OpenCV matcher scanning template"
         );
 
-        let regions = if rule.template_mat.cols() > screenshot_mat.cols()
+        let scan = if rule.template_mat.cols() > screenshot_mat.cols()
             || rule.template_mat.rows() > screenshot_mat.rows()
         {
-            Vec::new()
+            TemplateScan::unscored()
         } else {
             let result =
-                run_match_template(&screenshot_mat, &rule.template_mat).with_context(|| {
-                    format!(
-                        "OpenCV matchTemplate failed for `{}` using screenshot {}",
-                        rule.target_template,
-                        screenshot.display()
-                    )
+                run_match_template(screenshot_mat, &rule.template_mat).with_context(|| {
+                    format!("OpenCV matchTemplate failed for `{}`", rule.target_template)
                 })?;
             collect_regions(&result, rule.template_size, threshold)?
         };
-        debug!(target_template = %rule.target_template, candidates = regions.len(), "OpenCV matcher finished template scan");
+        // The score is logged for rejected templates too: a threshold set above
+        // what the screen actually produces is otherwise indistinguishable from
+        // a template that is simply not on screen.
+        debug!(
+            target_template = %rule.target_template,
+            score = scan.best_score,
+            threshold,
+            candidates = scan.regions.len(),
+            "OpenCV matcher finished template scan"
+        );
 
-        matches.insert(rule.target_template.clone(), regions);
+        matches.insert(rule.target_template.clone(), scan.regions);
     }
 
     Ok(matches)
