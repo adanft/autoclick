@@ -9,8 +9,9 @@ mod capture {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use anyhow::anyhow;
         use opencv::core::{Scalar, CV_8UC1};
-        use std::fs;
+        use std::collections::VecDeque;
 
         include!("unit/capture_tests.rs");
     }
@@ -161,7 +162,8 @@ mod app {
     }
 
     pub(crate) use bootstrap::{
-        create_wayland_backend_with, prepare_runtime_rules_with, run_with_io_and_monitors,
+        create_capture_service_with, create_wayland_backend_with, prepare_runtime_rules_with,
+        run_with_io_and_monitors,
     };
     pub(crate) use prompts::{load_or_configure_with_io, prompt_for_config, PromptIo};
     pub(crate) use summary::render_startup_summary;

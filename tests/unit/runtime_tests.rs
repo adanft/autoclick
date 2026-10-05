@@ -150,14 +150,14 @@ fn classifies_capture_failures_by_stage() {
         &[],
         0.95,
         &monitor,
-        || Err(anyhow!("grim missing")),
+        || Err(anyhow!("screencopy frame failed")),
         |_, _| Ok(MatchSet::new()),
         |_, _| Ok(Vec::new()),
     )
     .unwrap_err();
 
     assert_eq!(error.stage_label(), "capture");
-    assert!(error.to_string().contains("grim missing"));
+    assert!(error.to_string().contains("screencopy frame failed"));
 }
 
 #[test]
@@ -176,7 +176,7 @@ fn classifies_match_failures_by_stage() {
         &[],
         0.95,
         &monitor,
-        || Ok(CapturedImage::from_decoded("capture.png".into(), capture_mat(1920, 1080)).unwrap()),
+        || Ok(CapturedImage::from_decoded(capture_mat(1920, 1080)).unwrap()),
         |_, _| Err(anyhow!("OpenCV blew up")),
         |_, _| Ok(Vec::new()),
     )
@@ -202,7 +202,7 @@ fn classifies_click_failures_by_stage() {
         &[],
         0.95,
         &monitor,
-        || Ok(CapturedImage::from_decoded("capture.png".into(), capture_mat(1920, 1080)).unwrap()),
+        || Ok(CapturedImage::from_decoded(capture_mat(1920, 1080)).unwrap()),
         |_, _| Ok(MatchSet::new()),
         |_, _| Err(anyhow!("Wayland virtual pointer unavailable")),
     )
@@ -269,7 +269,7 @@ fn run_cycle_reuses_single_capture_and_single_match_pass_for_all_rules() {
         &monitor,
         move || {
             *capture_calls_for_closure.lock().unwrap() += 1;
-            Ok(CapturedImage::from_decoded("capture.png".into(), capture_mat(1920, 1080)).unwrap())
+            Ok(CapturedImage::from_decoded(capture_mat(1920, 1080)).unwrap())
         },
         move |_, threshold| {
             *match_calls_for_closure.lock().unwrap() += 1;
@@ -378,7 +378,7 @@ fn hands_the_decoded_screenshot_to_the_matcher_untouched() {
         &[],
         0.95,
         &monitor,
-        move || Ok(CapturedImage::from_decoded("capture.png".into(), screenshot).unwrap()),
+        move || Ok(CapturedImage::from_decoded(screenshot).unwrap()),
         move |image, _| {
             *seen_for_closure.lock().unwrap() = Some((
                 image.cols(),

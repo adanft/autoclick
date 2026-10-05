@@ -563,3 +563,51 @@
         );
         compositor.finish();
     }
+
+    /// Captures the real output named by `AUTOCLICK_LIVE_OUTPUT` from the active
+    /// session and reports timing. It only reads pixels: no pointer is created
+    /// and nothing is clicked.
+    ///
+    /// `AUTOCLICK_LIVE_OUTPUT=HDMI-A-1 cargo test --test unit \
+    ///     live_capture_of_configured_output -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a live wlr-screencopy compositor; set AUTOCLICK_LIVE_OUTPUT"]
+    fn live_capture_of_configured_output() {
+        const FRAMES: u32 = 10;
+
+        let Some(output) = std::env::var_os("AUTOCLICK_LIVE_OUTPUT") else {
+            eprintln!("AUTOCLICK_LIVE_OUTPUT is unset; skipping live capture");
+            return;
+        };
+        let output = output.to_string_lossy().into_owned();
+        let mut client = ScreencopyClient::connect(&output).unwrap();
+
+        let mut timings = Vec::new();
+        let mut last = None;
+        for _ in 0..FRAMES {
+            let started = std::time::Instant::now();
+            let frame = client.capture().unwrap();
+            timings.push(started.elapsed());
+            last = Some(frame);
+        }
+        let last = last.unwrap();
+
+        let min = timings.iter().min().unwrap().as_secs_f64() * 1000.0;
+        let avg = timings.iter().sum::<std::time::Duration>().as_secs_f64() * 1000.0
+            / f64::from(FRAMES);
+        println!(
+            "{output}: {}x{} grayscale, {FRAMES} captures, min {min:.2} ms, avg {avg:.2} ms",
+            last.cols(),
+            last.rows()
+        );
+        assert_eq!(last.typ(), CV_8UC1);
+        assert!(last.cols() > 0 && last.rows() > 0);
+
+        if let Some(path) = std::env::var_os("AUTOCLICK_LIVE_PNG") {
+            let path = path.to_string_lossy().into_owned();
+            let written =
+                opencv::imgcodecs::imwrite(&path, &last, &opencv::core::Vector::new()).unwrap();
+            assert!(written, "OpenCV refused to write {path}");
+            println!("{output}: last frame written to {path}");
+        }
+    }

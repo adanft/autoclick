@@ -47,7 +47,7 @@ pub fn run_monitor_loop(
     config: &AppConfig,
     prepared_rules: &[PreparedRule],
     monitor: &MonitorSpec,
-    capture: &CaptureService,
+    capture: &mut CaptureService,
     executor: &mut impl ClickExecutor,
     shutdown_rx: Receiver<()>,
 ) -> Result<()> {
@@ -115,7 +115,7 @@ pub(crate) fn run_cycle(
     prepared_rules: &[PreparedRule],
     match_threshold: f32,
     monitor: &MonitorSpec,
-    capture: &CaptureService,
+    capture: &mut CaptureService,
     executor: &mut impl ClickExecutor,
 ) -> std::result::Result<Vec<PlannedClick>, RuntimeCycleError> {
     run_cycle_with(
@@ -123,7 +123,7 @@ pub(crate) fn run_cycle(
         prepared_rules,
         match_threshold,
         monitor,
-        || capture.capture_monitor(monitor),
+        || capture.capture_monitor(),
         |screenshot, threshold| {
             matcher::scan_all(screenshot, prepared_rules, threshold).with_context(|| {
                 format!("OpenCV matching failed at threshold {:.2}", match_threshold)
@@ -148,7 +148,12 @@ where
     E: FnOnce(&MatchSet, ImageExtent) -> Result<Vec<PlannedClick>>,
 {
     let screenshot = capture_screenshot().map_err(RuntimeCycleError::Capture)?;
-    debug!(monitor = %monitor.name, screenshot = %screenshot.path.display(), "captured screenshot");
+    debug!(
+        monitor = %monitor.name,
+        width = screenshot.extent.width,
+        height = screenshot.extent.height,
+        "captured screenshot"
+    );
     let matches =
         scan_matches(&screenshot.image, match_threshold).map_err(RuntimeCycleError::Match)?;
     log_match_diagnostics(rules_config, prepared_rules, &matches, match_threshold);

@@ -17,7 +17,7 @@ Currently supported in practice:
 - a Wayland compositor advertising WLR virtual-pointer manager version 2 or later
 - exactly one usable Wayland seat
 - a configured connector whose Wayland output reports a completed Normal transform
-- screenshots via `grim`
+- a Wayland compositor advertising `zwlr_screencopy_manager_v1` (wlr-screencopy) and `wl_shm`
 - `hyprctl monitors -j` only for configured-monitor enumeration
 
 If your environment differs from that stack, assume it will need changes.
@@ -47,9 +47,9 @@ That was the original use case, but the same idea can also work for other simila
 ## Clone And Setup
 
 1. Install Rust.
-2. Install system binaries in `PATH`: `hyprctl`, `grim`.
-3. Run from the active Hyprland session so `hyprctl`, `grim`, and the Wayland client can access that session. In practice, preserve its `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and Hyprland environment.
-4. Ensure Hyprland advertises `zwlr_virtual_pointer_manager_v1` version 2 or later and permits the client to use it.
+2. Install system binaries in `PATH`: `hyprctl`.
+3. Run from the active Hyprland session so `hyprctl` and the Wayland client can access that session. In practice, preserve its `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and Hyprland environment.
+4. Ensure Hyprland advertises `zwlr_screencopy_manager_v1` plus `zwlr_virtual_pointer_manager_v1` version 2 or later, and permits the client to use them.
 5. Ensure the configured connector resolves to exactly one complete, Normal-transform Wayland output and exactly one usable seat is present.
 6. Install OpenCV development libraries required by the Rust `opencv` crate.
 7. Make sure the build environment can resolve OpenCV and Clang tooling. Package names are distro-specific.
@@ -130,7 +130,7 @@ Current behavior:
 - one global threshold
 - one `target_template` per rule
 - best match per template
-- one temporary `capture.png` reused per scan cycle, decoded once and handed to the matcher
+- one persistent wlr-screencopy connection captures the configured output, without the cursor, into a reused shared-memory buffer; each frame is converted straight to grayscale and handed to the matcher, with no external process, image encoding, or disk I/O
 - templates of a single uniform color are rejected during startup: normalized matching scores every position of every screenshot at 1.0 against them, so the runtime would click the top-left corner forever
 - runtime failures are surfaced by stage (`capture`, `OpenCV match`, `click execution`)
 - one persistent, output-bound Wayland virtual pointer sends absolute motion, left-button press, and left-button release directly from the process
@@ -161,8 +161,10 @@ DEBUG OpenCV matcher finished template scan target_template=accept_button.png sc
 The runtime uses three session-facing APIs:
 
 - `hyprctl monitors -j` discovers Hyprland monitor connector names and geometry for configuration
-- `grim` captures the selected connector for OpenCV template matching
+- `zwlr_screencopy_manager_v1` copies the selected output into a `wl_shm` buffer in-process for OpenCV template matching
 - `zwlr_virtual_pointer_v1` performs output-local pointer motion and clicking directly over Wayland
+
+Both Wayland clients need a wlroots-family compositor such as Hyprland or Sway; GNOME and KDE do not offer these protocols. The screencopy connection is opened once during startup, after the configured monitor is resolved, and startup fails with the connector named if the compositor does not offer screencopy for it.
 
 The virtual pointer is created once during startup and remains bound to the selected Wayland output for the process lifetime. If the selected manager, seat, or output becomes invalid, the backend reports an error rather than rebinding or retrying a click.
 
@@ -172,7 +174,14 @@ The virtual pointer is created once during startup and remains bound to the sele
 cargo test
 ```
 
-The test harness is rooted at `tests/unit.rs` and `tests/integration.rs`. Component tests live under `tests/unit/`, including the Wayland protocol and transaction coverage in `tests/unit/wayland_pointer_tests.rs`; they use an in-process test compositor/socket pair and do not inject input into the active desktop session.
+The test harness is rooted at `tests/unit.rs` and `tests/integration.rs`. Component tests live under `tests/unit/`, including the Wayland protocol and transaction coverage in `tests/unit/wayland_pointer_tests.rs` and `tests/unit/screencopy_tests.rs`; they use an in-process test compositor/socket pair and do not inject input into the active desktop session.
+
+One ignored test captures a real output from the active session to check screencopy and its timing. It only reads pixels and never creates a pointer or clicks:
+
+```bash
+AUTOCLICK_LIVE_OUTPUT=HDMI-A-1 AUTOCLICK_LIVE_PNG=/tmp/live.png \
+    cargo test --test unit live_capture_of_configured_output -- --ignored --nocapture
+```
 
 Known limitations:
 

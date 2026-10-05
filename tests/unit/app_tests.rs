@@ -70,12 +70,6 @@ fn write_saved_config(
         .unwrap();
 }
 
-fn set_path(bin_dir: &std::path::Path) -> Option<std::ffi::OsString> {
-    let original_path = crate::support::capture_env("PATH");
-    std::env::set_var("PATH", bin_dir);
-    original_path
-}
-
 #[test]
 fn runtime_input_contract_uses_only_wayland_pointer_and_monitor_enumeration() {
     let executable_sources = [
@@ -344,11 +338,9 @@ fn prompt_for_config_rejects_invalid_threshold_input() {
 }
 
 #[test]
-fn startup_fails_when_grim_dependency_is_missing() {
+fn startup_fails_when_screencopy_is_unavailable() {
     let _guard = crate::support::lock_env();
     let dir = tempdir().unwrap();
-    let bin_dir = dir.path().join("bin");
-    fs::create_dir_all(&bin_dir).unwrap();
 
     let config_path = dir.path().join("config.json");
     let templates_dir = dir.path().join("templates");
@@ -358,10 +350,17 @@ fn startup_fails_when_grim_dependency_is_missing() {
         0.95,
         "accept_button.png",
     );
-    write_png(&templates_dir.join("accept_button.png"));
+    let mut template = image::RgbaImage::from_pixel(4, 3, image::Rgba([255, 0, 0, 255]));
+    template.put_pixel(0, 0, image::Rgba([0, 0, 0, 255]));
+    template.save(templates_dir.join("accept_button.png")).unwrap();
 
-    let original_path = set_path(&bin_dir);
+    // An absolute WAYLAND_DISPLAY naming a socket that does not exist makes the
+    // connection fail without ever reaching the compositor of the test session.
+    let original_display = crate::support::capture_env("WAYLAND_DISPLAY");
+    let original_socket = crate::support::capture_env("WAYLAND_SOCKET");
     let original_config = crate::support::capture_env("AUTOCLICK_CONFIG_PATH");
+    std::env::set_var("WAYLAND_DISPLAY", dir.path().join("missing-wayland-0"));
+    std::env::remove_var("WAYLAND_SOCKET");
     std::env::set_var("AUTOCLICK_CONFIG_PATH", &config_path);
 
     let mut io = FakePromptIo::new(&["y"]);
@@ -370,11 +369,25 @@ fn startup_fails_when_grim_dependency_is_missing() {
         run_with_io_and_monitors(&mut io, &sample_monitors()).unwrap_err()
     );
 
-    crate::support::restore_env("PATH", original_path);
+    crate::support::restore_env("WAYLAND_DISPLAY", original_display);
+    crate::support::restore_env("WAYLAND_SOCKET", original_socket);
     crate::support::restore_env("AUTOCLICK_CONFIG_PATH", original_config);
 
-    assert!(error.contains("grim dependency check failed"));
-    assert!(error.contains("failed to execute grim"));
+    assert!(error.contains("screencopy capture setup failed for output `DP-1`"), "{error}");
+    assert!(error.contains("failed to connect to the Wayland compositor"), "{error}");
+}
+
+#[test]
+fn startup_contextualizes_screencopy_setup_failures_with_the_connector() {
+    let error = match create_capture_service_with("HDMI-A-1", |_| {
+        Err(anyhow!("the compositor does not advertise zwlr_screencopy_manager_v1"))
+    }) {
+        Ok(_) => panic!("capture unexpectedly connected"),
+        Err(error) => format!("{error:#}"),
+    };
+
+    assert!(error.contains("screencopy capture setup failed for output `HDMI-A-1`"));
+    assert!(error.contains("zwlr_screencopy_manager_v1"));
 }
 
 #[test]
@@ -392,13 +405,6 @@ fn startup_contextualizes_wayland_setup_failures_without_opening_a_device() {
 fn startup_fails_when_template_asset_is_corrupt() {
     let _guard = crate::support::lock_env();
     let dir = tempdir().unwrap();
-    let bin_dir = dir.path().join("bin");
-    fs::create_dir_all(&bin_dir).unwrap();
-
-    crate::support::write_executable_script(
-        &bin_dir.join("grim"),
-        "#!/bin/sh\nif [ \"$1\" = \"-h\" ]; then exit 0; fi\nexit 1\n",
-    );
 
     let config_path = dir.path().join("config.json");
     let templates_dir = dir.path().join("templates");
@@ -410,7 +416,6 @@ fn startup_fails_when_template_asset_is_corrupt() {
     );
     fs::write(templates_dir.join("accept_button.png"), b"not-a-real-png").unwrap();
 
-    let original_path = set_path(&bin_dir);
     let original_config = crate::support::capture_env("AUTOCLICK_CONFIG_PATH");
     std::env::set_var("AUTOCLICK_CONFIG_PATH", &config_path);
 
@@ -420,7 +425,6 @@ fn startup_fails_when_template_asset_is_corrupt() {
         run_with_io_and_monitors(&mut io, &sample_monitors()).unwrap_err()
     );
 
-    crate::support::restore_env("PATH", original_path);
     crate::support::restore_env("AUTOCLICK_CONFIG_PATH", original_config);
 
     assert!(error.contains("OpenCV/template validation failed"));

@@ -1,94 +1,77 @@
-use crate::monitor::MonitorSpec;
+use crate::screencopy::ScreencopyClient;
 use crate::wayland_pointer::ImageExtent;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use opencv::core::Mat;
-use opencv::imgcodecs;
 use opencv::prelude::*;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use tempfile::TempDir;
 
-/// A screenshot proven to have positive dimensions by the decoder used at the capture seam.
+/// A screenshot proven to have positive dimensions at the capture seam.
 ///
-/// The decoded matrix travels with the capture so the matcher can reuse it. Reading
-/// the dimensions used to mean decoding the PNG once here and once again in the
-/// matcher, which is a full-screen decode wasted on every cycle.
+/// The grayscale matrix travels with the capture so the matcher works on it
+/// directly instead of decoding the screen a second time.
 #[derive(Debug)]
 pub struct CapturedImage {
-    pub path: PathBuf,
     pub extent: ImageExtent,
     pub image: Mat,
 }
 
 impl CapturedImage {
-    pub fn from_decoded(path: PathBuf, image: Mat) -> Result<Self> {
+    pub fn from_decoded(image: Mat) -> Result<Self> {
         let (width, height) = (image.cols(), image.rows());
         if width <= 0 || height <= 0 {
             bail!("captured image extent must be positive, got {width}x{height}");
         }
         Ok(Self {
-            path,
             extent: ImageExtent { width, height },
             image,
         })
     }
 }
 
-/// Captures monitor screenshots into a temporary working directory.
-pub struct CaptureService {
-    temp_dir: TempDir,
+/// Produces grayscale frames of one output.
+///
+/// The seam between the capture service and the compositor, so the service can
+/// be exercised without a Wayland session.
+pub trait FrameSource {
+    fn capture_frame(&mut self) -> Result<Mat>;
+}
+
+impl FrameSource for ScreencopyClient {
+    fn capture_frame(&mut self) -> Result<Mat> {
+        self.capture()
+    }
+}
+
+/// Captures one configured output through a persistent frame source.
+pub struct CaptureService<S = ScreencopyClient> {
+    connector: String,
+    source: S,
 }
 
 impl CaptureService {
-    /// Creates a capture service backed by a fresh temporary directory.
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            temp_dir: tempfile::tempdir().context("failed to create screenshot temp directory")?,
-        })
+    /// Connects to the compositor's wlr-screencopy manager for `connector`.
+    pub fn connect(connector: &str) -> Result<Self> {
+        Ok(Self::with_source(
+            connector,
+            ScreencopyClient::connect(connector)?,
+        ))
+    }
+}
+
+impl<S: FrameSource> CaptureService<S> {
+    /// Wraps an already-connected frame source bound to `connector`.
+    pub fn with_source(connector: &str, source: S) -> Self {
+        Self {
+            connector: connector.to_string(),
+            source,
+        }
     }
 
-    /// Verifies that the `grim` dependency is installed and executable.
-    pub fn validate_dependency(&self) -> Result<()> {
-        let output = Command::new("grim")
-            .arg("-h")
-            .output()
-            .context("failed to execute grim")?;
-
-        if !output.status.success() {
-            bail!("grim is unavailable or returned a non-zero status");
-        }
-
-        Ok(())
-    }
-
-    /// Captures and decodes a PNG screenshot for the selected monitor.
-    pub fn capture_monitor(&self, monitor: &MonitorSpec) -> Result<CapturedImage> {
-        let path = self.temp_dir.path().join("capture.png");
-
-        let output = Command::new("grim")
-            .arg("-o")
-            .arg(&monitor.name)
-            .arg(&path)
-            .output()
-            .with_context(|| format!("failed to execute grim for monitor {}", monitor.name))?;
-
-        if !output.status.success() {
-            bail!(
-                "grim failed for monitor {}: {}",
-                monitor.name,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
-        if !Path::new(&path).exists() {
-            return Err(anyhow!(
-                "grim completed without producing a screenshot file"
-            ));
-        }
-
-        let decoded = imgcodecs::imread(&path.to_string_lossy(), imgcodecs::IMREAD_GRAYSCALE)
-            .with_context(|| format!("failed to decode captured screenshot {}", path.display()))?;
-        CapturedImage::from_decoded(path, decoded)
-            .context("captured screenshot has no usable extent")
+    /// Captures the bound output as a grayscale screenshot.
+    pub fn capture_monitor(&mut self) -> Result<CapturedImage> {
+        let image = self
+            .source
+            .capture_frame()
+            .with_context(|| format!("failed to capture output {}", self.connector))?;
+        CapturedImage::from_decoded(image).context("captured screenshot has no usable extent")
     }
 }

@@ -32,15 +32,12 @@ pub(crate) fn run_with_io_and_monitors(
 
     let monitor = resolve_configured_monitor(monitors, &selected_config.monitor_name)?;
 
-    let capture = CaptureService::new()?;
-    capture
-        .validate_dependency()
-        .context("grim dependency check failed")?;
     let prepared_rules = prepare_runtime_rules_with(
         &selected_config.rules,
         &store.templates_dir(),
         matcher::prepare_rules,
     )?;
+    let mut capture = create_capture_service_with(&monitor.name, CaptureService::connect)?;
     let mut executor = create_wayland_backend_with(&monitor.name, WaylandPointerBackend::connect)?;
 
     print!(
@@ -56,7 +53,7 @@ pub(crate) fn run_with_io_and_monitors(
         &selected_config,
         &prepared_rules,
         &monitor,
-        &capture,
+        &mut capture,
         &mut executor,
         shutdown_rx,
     )
@@ -69,6 +66,18 @@ fn resolve_configured_monitor(monitors: &[MonitorSpec], monitor_name: &str) -> R
         .find(|monitor| monitor.name == monitor_name)
         .cloned()
         .ok_or_else(|| anyhow!("configured monitor `{monitor_name}` is no longer available"))
+}
+
+pub(crate) fn create_capture_service_with<F>(connector: &str, connect: F) -> Result<CaptureService>
+where
+    F: FnOnce(&str) -> Result<CaptureService>,
+{
+    connect(connector).with_context(|| {
+        format!(
+            "screencopy capture setup failed for output `{connector}`; \
+             the compositor must support zwlr_screencopy_manager_v1"
+        )
+    })
 }
 
 pub(crate) fn create_wayland_backend_with<F>(
