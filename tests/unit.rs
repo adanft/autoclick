@@ -99,6 +99,17 @@ mod monitor {
     include!("../src/monitor.rs");
 }
 
+mod screencopy {
+    include!("../src/screencopy.rs");
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        include!("unit/screencopy_tests.rs");
+    }
+}
+
 mod wayland_pointer {
     include!("../src/wayland_pointer.rs");
 

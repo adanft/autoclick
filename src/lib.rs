@@ -14,6 +14,7 @@ pub mod matcher;
 pub mod monitor;
 pub mod rules;
 pub mod runtime;
+pub mod screencopy;
 pub mod wayland_pointer;
 
 /// Initializes stderr logging with `RUST_LOG`, defaulting to errors only.
