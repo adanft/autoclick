@@ -1,11 +1,32 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use opencv::core::{self, Mat, Rect, Vec4b};
 use opencv::imgproc;
 use opencv::prelude::*;
-use wayland_client::protocol::wl_shm::Format;
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::os::fd::AsFd;
+use std::os::unix::fs::FileExt;
+use wayland_client::protocol::{
+    wl_buffer::WlBuffer,
+    wl_output::{self, WlOutput},
+    wl_registry::{self, WlRegistry},
+    wl_shm::{Format, WlShm},
+    wl_shm_pool::WlShmPool,
+};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_protocols_wlr::screencopy::v1::client::{
+    zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
+    zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+};
 
 /// Bytes per pixel of every `wl_shm` format this module accepts.
 const BYTES_PER_PIXEL: u32 = 4;
+
+/// Highest `zwlr_screencopy_manager_v1` version spoken here; v3 adds `buffer_done`.
+const MAX_MANAGER_VERSION: u32 = 3;
+
+/// First `wl_output` version carrying the connector `name` event.
+const OUTPUT_NAME_VERSION: u32 = 4;
 
 /// Pixel layout of a `wl_shm` frame as announced by the screencopy `buffer` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +53,31 @@ impl FrameLayout {
     pub fn byte_len(&self) -> usize {
         self.stride as usize * self.height as usize
     }
+
+    /// Checks format, extent and stride, returning the conversion code and the
+    /// extent as OpenCV dimensions.
+    fn validate(&self) -> Result<(i32, i32, i32)> {
+        let conversion = self
+            .gray_conversion()
+            .with_context(|| format!("unsupported wl_shm format {:?}", self.format))?;
+        let (width, height) = match (i32::try_from(self.width), i32::try_from(self.height)) {
+            (Ok(width), Ok(height)) if width > 0 && height > 0 => (width, height),
+            _ => bail!(
+                "frame extent must be positive and fit in i32, got {}x{}",
+                self.width,
+                self.height
+            ),
+        };
+        let row_bytes = u64::from(self.width) * u64::from(BYTES_PER_PIXEL);
+        if u64::from(self.stride) < row_bytes || !self.stride.is_multiple_of(BYTES_PER_PIXEL) {
+            bail!(
+                "frame stride {} cannot hold {} pixels of {BYTES_PER_PIXEL} bytes per row",
+                self.stride,
+                self.width
+            );
+        }
+        Ok((conversion, width, height))
+    }
 }
 
 /// Converts a raw `wl_shm` frame into a single-channel 8-bit grayscale matrix,
@@ -40,25 +86,7 @@ impl FrameLayout {
 /// Row padding past `width` is skipped and a `y_invert` frame is flipped so row
 /// zero is always the top of the output.
 pub fn shm_frame_to_grayscale(pixels: &[u8], layout: &FrameLayout, y_invert: bool) -> Result<Mat> {
-    let conversion = layout
-        .gray_conversion()
-        .with_context(|| format!("unsupported wl_shm format {:?}", layout.format))?;
-    let (width, height) = match (i32::try_from(layout.width), i32::try_from(layout.height)) {
-        (Ok(width), Ok(height)) if width > 0 && height > 0 => (width, height),
-        _ => bail!(
-            "frame extent must be positive and fit in i32, got {}x{}",
-            layout.width,
-            layout.height
-        ),
-    };
-    let row_bytes = u64::from(layout.width) * u64::from(BYTES_PER_PIXEL);
-    if u64::from(layout.stride) < row_bytes || !layout.stride.is_multiple_of(BYTES_PER_PIXEL) {
-        bail!(
-            "frame stride {} cannot hold {} pixels of {BYTES_PER_PIXEL} bytes per row",
-            layout.stride,
-            layout.width
-        );
-    }
+    let (conversion, width, height) = layout.validate()?;
     if pixels.len() != layout.byte_len() {
         bail!(
             "frame holds {} bytes, expected {} bytes (stride {} x height {})",
@@ -87,4 +115,375 @@ pub fn shm_frame_to_grayscale(pixels: &[u8], layout: &FrameLayout, y_invert: boo
     let mut flipped = Mat::default();
     core::flip(&gray, &mut flipped, 0).context("failed to flip a y-inverted shm frame")?;
     Ok(flipped)
+}
+
+enum FrameOutcome {
+    Ready,
+    Failed,
+}
+
+/// Events of the one frame currently in flight.
+#[derive(Default)]
+struct FrameState {
+    serial: u64,
+    offer: Option<FrameLayout>,
+    rejected_offers: Vec<WEnum<Format>>,
+    buffers_done: bool,
+    y_invert: bool,
+    outcome: Option<FrameOutcome>,
+}
+
+impl FrameState {
+    fn new(serial: u64) -> Self {
+        Self {
+            serial,
+            ..Self::default()
+        }
+    }
+
+    /// Whether every buffer type has been announced. Before v3 there is no
+    /// `buffer_done`, so the single `buffer` event closes the offer.
+    fn offer_complete(&self, has_buffer_done: bool) -> bool {
+        if has_buffer_done {
+            self.buffers_done
+        } else {
+            self.offer.is_some() || !self.rejected_offers.is_empty()
+        }
+    }
+}
+
+/// Callback-owned discovery and frame state. Output proxy user data is its
+/// registry name.
+#[derive(Default)]
+struct ClientState {
+    manager: Option<ZwlrScreencopyManagerV1>,
+    shm: Option<WlShm>,
+    outputs: BTreeMap<u32, (WlOutput, Option<String>)>,
+    selected_output: Option<u32>,
+    selected_output_removed: bool,
+    frame: FrameState,
+}
+
+impl Dispatch<WlRegistry, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        registry: &WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } if interface == ZwlrScreencopyManagerV1::interface().name => {
+                state.manager = Some(registry.bind(name, version.min(MAX_MANAGER_VERSION), qh, ()));
+            }
+            wl_registry::Event::Global {
+                name, interface, ..
+            } if interface == WlShm::interface().name => {
+                state.shm = Some(registry.bind(name, 1, qh, ()));
+            }
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } if interface == WlOutput::interface().name => {
+                let output = registry.bind(name, version.min(OUTPUT_NAME_VERSION), qh, name);
+                state.outputs.insert(name, (output, None));
+            }
+            wl_registry::Event::GlobalRemove { name } => {
+                state.outputs.remove(&name);
+                if state.selected_output == Some(name) {
+                    state.selected_output_removed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlOutput, u32> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &WlOutput,
+        event: wl_output::Event,
+        id: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Name { name } = event {
+            if let Some((_, output_name)) = state.outputs.get_mut(id) {
+                *output_name = Some(name);
+            }
+        }
+    }
+}
+
+impl Dispatch<ZwlrScreencopyFrameV1, u64> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &ZwlrScreencopyFrameV1,
+        event: zwlr_screencopy_frame_v1::Event,
+        serial: &u64,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwlr_screencopy_frame_v1::{Event, Flags};
+
+        let frame = &mut state.frame;
+        // A late event from an earlier, already destroyed frame must not leak
+        // into the current capture.
+        if frame.serial != *serial {
+            return;
+        }
+        match event {
+            Event::Buffer {
+                format,
+                width,
+                height,
+                stride,
+            } => match format {
+                WEnum::Value(format) if frame.offer.is_none() => {
+                    let layout = FrameLayout {
+                        format,
+                        width,
+                        height,
+                        stride,
+                    };
+                    if layout.gray_conversion().is_some() {
+                        frame.offer = Some(layout);
+                    } else {
+                        frame.rejected_offers.push(WEnum::Value(format));
+                    }
+                }
+                WEnum::Unknown(_) if frame.offer.is_none() => frame.rejected_offers.push(format),
+                _ => {}
+            },
+            Event::BufferDone => frame.buffers_done = true,
+            Event::Flags {
+                flags: WEnum::Value(flags),
+            } => frame.y_invert = flags.contains(Flags::YInvert),
+            Event::Ready { .. } => frame.outcome = Some(FrameOutcome::Ready),
+            Event::Failed => frame.outcome = Some(FrameOutcome::Failed),
+            // dmabuf offers and damage are irrelevant to an shm copy.
+            _ => {}
+        }
+    }
+}
+
+wayland_client::delegate_noop!(ClientState: ignore ZwlrScreencopyManagerV1);
+wayland_client::delegate_noop!(ClientState: ignore WlShm);
+wayland_client::delegate_noop!(ClientState: ignore WlShmPool);
+wayland_client::delegate_noop!(ClientState: ignore WlBuffer);
+
+/// A memfd-backed `wl_shm` buffer kept across captures of the same layout.
+struct ShmBuffer {
+    layout: FrameLayout,
+    file: File,
+    pool: WlShmPool,
+    buffer: WlBuffer,
+}
+
+impl ShmBuffer {
+    fn allocate(shm: &WlShm, layout: FrameLayout, qh: &QueueHandle<ClientState>) -> Result<Self> {
+        let (_, width, height) = layout.validate()?;
+        let size = i32::try_from(layout.byte_len()).with_context(|| {
+            format!("frame of {} bytes exceeds a wl_shm pool", layout.byte_len())
+        })?;
+        let stride = i32::try_from(layout.stride)?;
+        let fd = rustix::fs::memfd_create(c"autoclick-screencopy", rustix::fs::MemfdFlags::CLOEXEC)
+            .context("failed to create a memfd for the screencopy buffer")?;
+        let file = File::from(fd);
+        file.set_len(layout.byte_len() as u64)
+            .context("failed to size the screencopy memfd")?;
+        let pool = shm.create_pool(file.as_fd(), size, qh, ());
+        let buffer = pool.create_buffer(0, width, height, stride, layout.format, qh, ());
+        Ok(Self {
+            layout,
+            file,
+            pool,
+            buffer,
+        })
+    }
+
+    fn destroy(self) {
+        self.buffer.destroy();
+        self.pool.destroy();
+    }
+}
+
+/// Captures one Wayland output in-process through `zwlr_screencopy_manager_v1`.
+///
+/// Owns a persistent connection and reuses its shm buffer while the frame
+/// layout stays the same, so a steady-state capture allocates nothing new.
+pub struct ScreencopyClient {
+    connection: Connection,
+    event_queue: EventQueue<ClientState>,
+    state: ClientState,
+    manager: ZwlrScreencopyManagerV1,
+    output: WlOutput,
+    connector: String,
+    buffer: Option<ShmBuffer>,
+    pixels: Vec<u8>,
+    next_serial: u64,
+}
+
+impl ScreencopyClient {
+    /// Connects to the compositor from the environment and selects the output
+    /// named `connector`. Fails when screencopy, `wl_shm` or the output is missing.
+    pub fn connect(connector: &str) -> Result<Self> {
+        let connection =
+            Connection::connect_to_env().context("failed to connect to the Wayland compositor")?;
+        Self::from_connection(connection, connector)
+    }
+
+    fn from_connection(connection: Connection, connector: &str) -> Result<Self> {
+        let mut event_queue = connection.new_event_queue();
+        // Not retained: `wl_registry` has no destroy request.
+        connection.display().get_registry(&event_queue.handle(), ());
+        let mut state = ClientState::default();
+        event_queue
+            .roundtrip(&mut state)
+            .context("Wayland registry discovery roundtrip failed")?;
+        // Outputs bound in the first roundtrip announce their names in the second.
+        event_queue
+            .roundtrip(&mut state)
+            .context("Wayland output metadata discovery roundtrip failed")?;
+
+        let manager = state.manager.clone().ok_or_else(|| {
+            anyhow!("the compositor does not advertise zwlr_screencopy_manager_v1 (wlr-screencopy)")
+        })?;
+        if state.shm.is_none() {
+            bail!("the compositor does not advertise wl_shm");
+        }
+        let matching: Vec<_> = state
+            .outputs
+            .iter()
+            .filter(|(_, (_, name))| name.as_deref() == Some(connector))
+            .map(|(&id, (output, _))| (id, output.clone()))
+            .collect();
+        let (id, output) = match matching.as_slice() {
+            [selected] => selected.clone(),
+            [] => bail!("configured connector {connector} was not found among Wayland outputs"),
+            matches => bail!(
+                "configured connector {connector} is ambiguous: {} Wayland outputs match",
+                matches.len()
+            ),
+        };
+        state.selected_output = Some(id);
+
+        Ok(Self {
+            connection,
+            event_queue,
+            state,
+            manager,
+            output,
+            connector: connector.into(),
+            buffer: None,
+            pixels: Vec::new(),
+            next_serial: 0,
+        })
+    }
+
+    /// Captures the selected output, without the cursor, as a grayscale matrix.
+    ///
+    /// A failed frame is destroyed and reported; the next call starts a fresh one.
+    pub fn capture(&mut self) -> Result<Mat> {
+        if self.state.selected_output_removed {
+            bail!("Wayland output {} was removed", self.connector);
+        }
+        self.next_serial += 1;
+        self.state.frame = FrameState::new(self.next_serial);
+        let frame = self.manager.capture_output(
+            0,
+            &self.output,
+            &self.event_queue.handle(),
+            self.next_serial,
+        );
+        let captured = self.copy_frame(&frame);
+        frame.destroy();
+        let flushed = self
+            .connection
+            .flush()
+            .context("failed to flush the screencopy frame destruction");
+        let image = captured?;
+        flushed?;
+        Ok(image)
+    }
+
+    fn copy_frame(&mut self, frame: &ZwlrScreencopyFrameV1) -> Result<Mat> {
+        let has_buffer_done = frame.version() >= 3;
+        self.dispatch_until(|frame| {
+            frame.outcome.is_some() || frame.offer_complete(has_buffer_done)
+        })?;
+        if self.state.frame.outcome.is_some() {
+            bail!("the compositor failed the screencopy frame before offering a buffer");
+        }
+        let layout = self.state.frame.offer.ok_or_else(|| {
+            anyhow!(
+                "the compositor offered no supported wl_shm screencopy format: {:?}",
+                self.state.frame.rejected_offers
+            )
+        })?;
+
+        frame.copy(&self.reusable_buffer(layout)?.buffer);
+        self.dispatch_until(|frame| frame.outcome.is_some())?;
+        if let Some(FrameOutcome::Failed) = self.state.frame.outcome {
+            bail!("the compositor reported the screencopy frame as failed");
+        }
+
+        let buffer = self
+            .buffer
+            .as_ref()
+            .context("screencopy shm buffer disappeared during the copy")?;
+        self.pixels.resize(layout.byte_len(), 0);
+        buffer
+            .file
+            .read_exact_at(&mut self.pixels, 0)
+            .context("failed to read the screencopy shm buffer")?;
+        shm_frame_to_grayscale(&self.pixels, &layout, self.state.frame.y_invert)
+    }
+
+    /// Returns the cached buffer when the layout is unchanged, else replaces it.
+    fn reusable_buffer(&mut self, layout: FrameLayout) -> Result<&ShmBuffer> {
+        if self.buffer.as_ref().map(|buffer| buffer.layout) != Some(layout) {
+            if let Some(stale) = self.buffer.take() {
+                stale.destroy();
+            }
+            let shm = self.state.shm.as_ref().context("wl_shm is unavailable")?;
+            self.buffer = Some(ShmBuffer::allocate(
+                shm,
+                layout,
+                &self.event_queue.handle(),
+            )?);
+        }
+        self.buffer
+            .as_ref()
+            .context("screencopy shm buffer is unavailable")
+    }
+
+    fn dispatch_until(&mut self, done: impl Fn(&FrameState) -> bool) -> Result<()> {
+        while !done(&self.state.frame) {
+            self.event_queue
+                .blocking_dispatch(&mut self.state)
+                .context("Wayland dispatch failed while waiting for a screencopy frame")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ScreencopyClient {
+    /// Releases the shm buffer and the manager on shutdown.
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            buffer.destroy();
+        }
+        self.manager.destroy();
+        if let Err(error) = self.connection.flush() {
+            tracing::warn!(error = %error, "Wayland screencopy cleanup failed during shutdown");
+        }
+    }
 }

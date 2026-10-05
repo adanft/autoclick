@@ -36,6 +36,7 @@ dependencies = [
  "anyhow",
  "image",
  "opencv",
+ "rustix",
  "serde",
  "serde_json",
  "signal-hook",
