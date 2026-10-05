@@ -131,10 +131,19 @@ fn prompt_rules(io: &mut impl PromptIo) -> Result<Vec<RuleConfig>> {
         let target_template = io.prompt(&prompt_label, None)?;
         validate_target_template_name(&target_template)
             .context("rule target template is invalid")?;
+        let target_template = target_template.trim().to_string();
 
-        rules.push(RuleConfig {
-            target_template: target_template.trim().to_string(),
-        });
+        if rules
+            .iter()
+            .any(|rule: &RuleConfig| rule.target_template == target_template)
+        {
+            println!(
+                "`{target_template}` is already used by another rule; enter a different template"
+            );
+            continue;
+        }
+
+        rules.push(RuleConfig { target_template });
 
         if !confirm(io, "add another rule? [y/N] ", false)? {
             break;

@@ -202,3 +202,58 @@ fn saves_the_threshold_without_widening_it_to_f64() {
     assert!(raw.contains("\"version\": 1"), "{raw}");
     assert_eq!(store.load().unwrap(), example_config());
 }
+
+#[test]
+fn rejects_duplicate_target_templates_on_load() {
+    let raw = r#"{
+        "monitor_name": "DP-1",
+        "interval_ms": 200,
+        "match_threshold": 0.95,
+        "rules": [
+            {"target_template": "accept_button.png"},
+            {"target_template": "ready_button.png"},
+            {"target_template": " accept_button.png "}
+        ]
+    }"#;
+
+    let error = format!("{:#}", parse_config(raw).unwrap_err());
+    assert!(error.contains("config.rules[2].target_template"), "{error}");
+    assert!(error.contains("config.rules[0]"), "{error}");
+    assert!(error.contains("duplicate target template `accept_button.png`"), "{error}");
+}
+
+#[test]
+fn rejects_duplicate_target_templates_on_save() {
+    let dir = tempdir().unwrap();
+    let store = ConfigStore::from_path(dir.path().join("autoclick").join("config.json"));
+    let mut config = example_config();
+    config.rules.push(RuleConfig {
+        target_template: "accept_button.png".to_string(),
+    });
+
+    let error = format!("{:#}", store.save(&config).unwrap_err());
+    assert!(error.contains("duplicate target template `accept_button.png`"), "{error}");
+    assert!(!store.exists());
+}
+
+#[test]
+fn classifies_a_saved_config_with_duplicate_templates_as_incompatible() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "monitor_name": "DP-1",
+            "interval_ms": 200,
+            "match_threshold": 0.95,
+            "rules": [
+                {"target_template": "accept_button.png"},
+                {"target_template": "accept_button.png"}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let error = ConfigStore::from_path(path).load().unwrap_err();
+    assert!(matches!(error, ConfigLoadError::Incompatible(_)), "{error}");
+}

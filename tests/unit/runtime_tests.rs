@@ -38,7 +38,7 @@ impl crate::wayland_pointer::ClickExecutor for RecordingExecutor {
 }
 
 #[test]
-fn evaluates_multiple_rules_from_same_match_set_in_order() {
+fn plans_only_the_first_matching_rule_from_the_match_set() {
     let _monitor = crate::monitor::MonitorSpec {
         index: 1,
         name: "DP-1".to_string(),
@@ -76,11 +76,15 @@ fn evaluates_multiple_rules_from_same_match_set_in_order() {
         },
     ];
 
-    let planned = crate::rules::evaluate_rules(&rules, &matches, crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 });
+    let planned = crate::rules::evaluate_rules(
+        &rules,
+        &matches,
+        crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 },
+        None,
+    )
+    .expect("both rules matched");
 
-    assert_eq!(planned.len(), 2);
-    assert_eq!(planned[0].rule_index, 0);
-    assert_eq!(planned[1].rule_index, 1);
+    assert_eq!(planned.rule_index, 0);
 }
 
 fn capture_failure(message: &'static str) -> RuntimeCycleError {
@@ -234,7 +238,7 @@ fn classifies_capture_failures_by_stage() {
         &monitor,
         || Err(anyhow!("screencopy frame failed")),
         |_, _| Ok(MatchSet::new()),
-        |_, _| Ok(Vec::new()),
+        |_, _| Ok(None),
     )
     .unwrap_err();
 
@@ -260,7 +264,7 @@ fn classifies_match_failures_by_stage() {
         &monitor,
         || Ok(CapturedImage::from_decoded(capture_mat(1920, 1080)).unwrap()),
         |_, _| Err(anyhow!("OpenCV blew up")),
-        |_, _| Ok(Vec::new()),
+        |_, _| Ok(None),
     )
     .unwrap_err();
 
@@ -316,7 +320,7 @@ fn continues_into_later_cycles_after_successful_clicks() {
 }
 
 #[test]
-fn run_cycle_reuses_single_capture_and_single_match_pass_for_all_rules() {
+fn run_cycle_scans_all_rules_once_and_clicks_only_the_first_match() {
     let monitor = crate::monitor::MonitorSpec {
         index: 1,
         name: "DP-1".to_string(),
@@ -378,31 +382,20 @@ fn run_cycle_reuses_single_capture_and_single_match_pass_for_all_rules() {
             ]))
         },
         |matches, extent| {
-            execute_match_set(&rules_for_execution, extent, matches, &mut executor)
+            execute_match_set(&rules_for_execution, extent, matches, None, &mut executor)
         },
     )
     .unwrap();
 
-    assert_eq!(
-        planned,
-        vec![
-            crate::wayland_pointer::PlannedClick {
-                rule_index: 0,
-                target_template: "accept_button.png".to_string(),
-                output_x: 20,
-                output_y: 25,
-                extent: crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 },
-            },
-            crate::wayland_pointer::PlannedClick {
-                rule_index: 1,
-                target_template: "ready_button.png".to_string(),
-                output_x: 40,
-                output_y: 45,
-                extent: crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 },
-            },
-        ]
-    );
-    assert_eq!(executor.clicks.len(), 2);
+    let expected = crate::wayland_pointer::PlannedClick {
+        rule_index: 0,
+        target_template: "accept_button.png".to_string(),
+        output_x: 20,
+        output_y: 25,
+        extent: crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 },
+    };
+    assert_eq!(planned, Some(expected.clone()));
+    assert_eq!(executor.clicks, vec![expected]);
     assert_eq!(*capture_calls.lock().unwrap(), 1);
     assert_eq!(*match_calls.lock().unwrap(), 1);
 }
@@ -413,10 +406,16 @@ fn execute_match_set_invokes_wayland_executor_with_output_local_plan() {
     let matches = MatchSet::from([("accept_button.png".to_string(), vec![MatchRegion { left: 10, top: 20, width: 20, height: 10 }])]);
     let mut executor = RecordingExecutor::default();
 
-    let planned = execute_match_set(&rules, crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 }, &matches, &mut executor).unwrap();
+    let planned = execute_match_set(
+        &rules,
+        crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 },
+        &matches,
+        None,
+        &mut executor,
+    )
+    .unwrap();
 
-    assert_eq!(planned.len(), 1);
-    assert_eq!(executor.clicks, planned);
+    assert_eq!(executor.clicks, planned.into_iter().collect::<Vec<_>>());
     assert_eq!(executor.clicks[0].output_x, 20);
     assert_eq!(executor.clicks[0].output_y, 25);
     assert_eq!(executor.clicks[0].extent, crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 });
@@ -429,7 +428,14 @@ fn execute_match_set_surfaces_executor_failure() {
     let matches = MatchSet::from([("accept_button.png".to_string(), vec![MatchRegion { left: 0, top: 0, width: 2, height: 2 }])]);
     let mut executor = RecordingExecutor { clicks: Vec::new(), failure: Some(anyhow!("selected output was removed")) };
 
-    let error = execute_match_set(&rules, crate::wayland_pointer::ImageExtent { width: 2, height: 2 }, &matches, &mut executor).unwrap_err();
+    let error = execute_match_set(
+        &rules,
+        crate::wayland_pointer::ImageExtent { width: 2, height: 2 },
+        &matches,
+        None,
+        &mut executor,
+    )
+    .unwrap_err();
     assert!(format!("{error:#}").contains("selected output was removed"));
 }
 
@@ -470,9 +476,105 @@ fn hands_the_decoded_screenshot_to_the_matcher_untouched() {
             ));
             Ok(MatchSet::new())
         },
-        |matches, extent| execute_match_set(&[], extent, matches, &mut executor),
+        |matches, extent| execute_match_set(&[], extent, matches, None, &mut executor),
     )
     .unwrap();
 
     assert_eq!(*seen.lock().unwrap(), Some((6, 4, 231, 0)));
+}
+
+#[test]
+fn execute_match_set_sends_one_click_when_two_rules_match() {
+    let rules = vec![
+        crate::config::RuleConfig { target_template: "accept_button.png".to_string() },
+        crate::config::RuleConfig { target_template: "ready_button.png".to_string() },
+    ];
+    let matches = MatchSet::from([
+        (
+            "accept_button.png".to_string(),
+            vec![MatchRegion { left: 10, top: 20, width: 20, height: 10 }],
+        ),
+        (
+            "ready_button.png".to_string(),
+            vec![MatchRegion { left: 30, top: 40, width: 20, height: 10 }],
+        ),
+    ]);
+    let mut executor = RecordingExecutor::default();
+
+    execute_match_set(
+        &rules,
+        crate::wayland_pointer::ImageExtent { width: 1920, height: 1080 },
+        &matches,
+        None,
+        &mut executor,
+    )
+    .unwrap();
+
+    assert_eq!(executor.clicks.len(), 1);
+    assert_eq!(executor.clicks[0].rule_index, 0);
+    assert_eq!((executor.clicks[0].output_x, executor.clicks[0].output_y), (20, 25));
+}
+
+#[test]
+fn consecutive_cycles_take_turns_and_reset_when_nothing_is_clicked() {
+    let monitor = crate::monitor::MonitorSpec {
+        index: 1,
+        name: "DP-1".to_string(),
+        width: 1920,
+        height: 1080,
+        origin_x: 0,
+        origin_y: 0,
+    };
+    let rules = vec![
+        crate::config::RuleConfig { target_template: "accept_button.png".to_string() },
+        crate::config::RuleConfig { target_template: "ready_button.png".to_string() },
+    ];
+    let both = || {
+        MatchSet::from([
+            (
+                "accept_button.png".to_string(),
+                vec![MatchRegion { left: 10, top: 20, width: 20, height: 10 }],
+            ),
+            (
+                "ready_button.png".to_string(),
+                vec![MatchRegion { left: 30, top: 40, width: 20, height: 10 }],
+            ),
+        ])
+    };
+    // Some(set) is a cycle that scans `set`; None is a cycle whose capture fails.
+    let cycles = vec![
+        Some(both()),
+        Some(both()),
+        Some(both()),
+        Some(both()),
+        Some(MatchSet::new()),
+        Some(both()),
+        None,
+        Some(both()),
+    ];
+    let mut executor = RecordingExecutor::default();
+    let mut previous_click = None;
+
+    for cycle in cycles {
+        let outcome = run_cycle_with(
+            &rules,
+            &[],
+            0.95,
+            &monitor,
+            || match cycle {
+                Some(_) => Ok(CapturedImage::from_decoded(capture_mat(1920, 1080)).unwrap()),
+                None => Err(anyhow!("screencopy frame failed")),
+            },
+            |_, _| Ok(cycle.clone().unwrap_or_default()),
+            |matches, extent| {
+                execute_match_set(&rules, extent, matches, previous_click, &mut executor)
+            },
+        );
+        previous_click = rule_clicked_by(&outcome);
+    }
+
+    let clicked: Vec<usize> = executor.clicks.iter().map(|click| click.rule_index).collect();
+    // Two rules alternate; the empty cycle and the failed capture each restart
+    // the rotation, so the click after them goes to the first rule again.
+    assert_eq!(clicked, vec![0, 1, 0, 1, 0, 0]);
 }

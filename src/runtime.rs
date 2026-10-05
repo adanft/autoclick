@@ -59,17 +59,35 @@ pub fn run_monitor_loop(
     executor: &mut impl ClickExecutor,
     shutdown_rx: Receiver<()>,
 ) -> Result<()> {
+    // The rule clicked in the previous cycle, so the next cycle can give the
+    // other matched rules a turn first. Starts empty: no cycle has clicked yet.
+    let mut previous_click = None;
     run_monitor_loop_with_runner(config.interval_ms, shutdown_rx, || {
-        run_cycle(
+        let outcome = run_cycle(
             &config.rules,
             prepared_rules,
             config.match_threshold,
             monitor,
             capture,
             executor,
-        )
-        .map(|_| ())
+            previous_click,
+        );
+        previous_click = rule_clicked_by(&outcome);
+        outcome.map(|_| ())
     })
+}
+
+/// Returns the rule a cycle clicked, which the next cycle searches after.
+///
+/// A cycle that clicked nothing, or failed before clicking, resets the turn
+/// order so the next click follows configuration order again.
+fn rule_clicked_by(
+    outcome: &std::result::Result<Option<PlannedClick>, RuntimeCycleError>,
+) -> Option<usize> {
+    match outcome {
+        Ok(Some(click)) => Some(click.rule_index),
+        Ok(None) | Err(_) => None,
+    }
 }
 
 fn run_monitor_loop_with_runner<F>(
@@ -138,7 +156,8 @@ pub(crate) fn run_cycle(
     monitor: &MonitorSpec,
     capture: &mut CaptureService,
     executor: &mut impl ClickExecutor,
-) -> std::result::Result<Vec<PlannedClick>, RuntimeCycleError> {
+    previous_click: Option<usize>,
+) -> std::result::Result<Option<PlannedClick>, RuntimeCycleError> {
     run_cycle_with(
         rules_config,
         prepared_rules,
@@ -150,7 +169,9 @@ pub(crate) fn run_cycle(
                 format!("OpenCV matching failed at threshold {:.2}", match_threshold)
             })
         },
-        |matches, extent| execute_match_set(rules_config, extent, matches, executor),
+        |matches, extent| {
+            execute_match_set(rules_config, extent, matches, previous_click, executor)
+        },
     )
 }
 
@@ -162,11 +183,11 @@ fn run_cycle_with<C, M, E>(
     capture_screenshot: C,
     scan_matches: M,
     execute_cycle: E,
-) -> std::result::Result<Vec<PlannedClick>, RuntimeCycleError>
+) -> std::result::Result<Option<PlannedClick>, RuntimeCycleError>
 where
     C: FnOnce() -> Result<CapturedImage>,
     M: FnOnce(&Mat, f32) -> Result<MatchSet>,
-    E: FnOnce(&MatchSet, ImageExtent) -> Result<Vec<PlannedClick>>,
+    E: FnOnce(&MatchSet, ImageExtent) -> Result<Option<PlannedClick>>,
 {
     let screenshot = capture_screenshot().map_err(RuntimeCycleError::Capture)?;
     debug!(
@@ -222,15 +243,21 @@ fn log_match_diagnostics(
     }
 }
 
-/// Converts accepted matches into Wayland click executions.
+/// Executes at most one Wayland click for a rule whose template matched this
+/// cycle's screenshot.
+///
+/// `previous_click` is the rule clicked in the previous cycle; matched rules
+/// after it get the turn first (see [`rules::evaluate_rules`]). With `None`
+/// the first matched rule in configuration order is clicked.
 pub fn execute_match_set(
     rules_config: &[RuleConfig],
     extent: ImageExtent,
     matches: &MatchSet,
+    previous_click: Option<usize>,
     executor: &mut impl ClickExecutor,
-) -> Result<Vec<PlannedClick>> {
-    let planned = rules::evaluate_rules(rules_config, matches, extent);
-    for click in &planned {
+) -> Result<Option<PlannedClick>> {
+    let planned = rules::evaluate_rules(rules_config, matches, extent, previous_click);
+    if let Some(click) = &planned {
         info!(
             rule_index = click.rule_index + 1,
             target_template = %click.target_template,

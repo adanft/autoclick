@@ -13,8 +13,8 @@ pub use prepare::prepare_rules;
 
 /// Prepared runtime representation of one configured template rule.
 ///
-/// The template image is decoded once and shared across duplicate rules via
-/// `Arc<Mat>` so the runtime loop avoids repeated disk I/O and decoding work.
+/// The template image is decoded once at startup and held behind `Arc<Mat>` so
+/// the runtime loop avoids repeated disk I/O and decoding work.
 #[derive(Debug, Clone)]
 pub struct PreparedRule {
     pub target_template: String,

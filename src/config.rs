@@ -163,6 +163,22 @@ fn validate_app_config(config: &AppConfig) -> Result<()> {
             .with_context(|| format!("config.rules[{index}].target_template is invalid"))?;
     }
 
+    // Matched rules take turns, one click per cycle, so a repeated template
+    // would click the same target on consecutive cycles instead of letting
+    // the other rules have their turn.
+    for (index, rule) in config.rules.iter().enumerate() {
+        let template = rule.target_template.trim();
+        if let Some(first) = config.rules[..index]
+            .iter()
+            .position(|earlier| earlier.target_template.trim() == template)
+        {
+            bail!(
+                "config.rules[{index}].target_template repeats config.rules[{first}]: \
+                 duplicate target template `{template}`"
+            );
+        }
+    }
+
     Ok(())
 }
 

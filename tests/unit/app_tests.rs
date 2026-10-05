@@ -471,3 +471,53 @@ fn startup_summary_survives_a_short_prepared_rules_list() {
     assert!(summary.contains("2. ready_button.png"), "{summary}");
     assert!(summary.contains("asset: unavailable"), "{summary}");
 }
+
+#[test]
+fn prompt_re_asks_when_a_target_template_was_already_entered() {
+    let mut io = FakePromptIo::new(&[
+        "1",
+        "250",
+        "0.95",
+        "accept_button.png",
+        "y",
+        " accept_button.png ",
+        "ready_button.png",
+        "n",
+    ]);
+
+    let config = prompt_for_config(&sample_monitors(), &mut io).unwrap();
+
+    let templates: Vec<_> =
+        config.rules.iter().map(|rule| rule.target_template.as_str()).collect();
+    assert_eq!(templates, ["accept_button.png", "ready_button.png"]);
+}
+
+#[test]
+fn reconfigures_when_saved_config_has_duplicate_target_templates() {
+    let dir = tempdir().unwrap();
+    let config_path = dir.path().join("config.json");
+    std::fs::write(
+        &config_path,
+        r#"{
+            "monitor_name": "DP-1",
+            "interval_ms": 250,
+            "match_threshold": 0.95,
+            "rules": [
+                {"target_template": "accept_button.png"},
+                {"target_template": "accept_button.png"}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let store = crate::config::ConfigStore::from_path(config_path);
+    fs::create_dir_all(store.templates_dir()).unwrap();
+    write_png(&store.templates_dir().join("ready_button.png"));
+    let mut io = FakePromptIo::new(&["y", "1", "250", "0.95", "ready_button.png", "n"]);
+
+    let config = load_or_configure_with_io(&store, &sample_monitors(), &mut io).unwrap();
+
+    assert_eq!(config.rules.len(), 1);
+    assert_eq!(config.rules[0].target_template, "ready_button.png");
+    assert_eq!(store.load().unwrap(), config);
+}

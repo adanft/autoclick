@@ -11,7 +11,7 @@ impl ClickExecutor for RecordingExecutor {
     }
 }
 #[test]
-fn executes_clicks_for_multiple_rules_in_order_through_public_api() {
+fn clicks_only_the_first_matching_rule_through_public_api() {
     let rules = vec![
         RuleConfig {
             target_template: "accept_button.png".to_string(),
@@ -48,10 +48,14 @@ fn executes_clicks_for_multiple_rules_in_order_through_public_api() {
             height: 1080,
         },
         &matches,
+        None,
         &mut executor,
     )
     .unwrap();
-    assert_eq!(executor.0, planned);
-    assert_eq!((planned[0].output_x, planned[0].output_y), (20, 25));
-    assert_eq!((planned[1].output_x, planned[1].output_y), (40, 45));
+    let click = planned.expect("the first rule matched");
+    assert_eq!(executor.0, vec![click.clone()]);
+    assert_eq!(
+        (click.rule_index, click.output_x, click.output_y),
+        (0, 20, 25)
+    );
 }

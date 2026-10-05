@@ -133,7 +133,10 @@ Current behavior:
 
 - one global threshold
 - one `target_template` per rule
+- each `target_template` may appear in only one rule (compared after trimming surrounding whitespace); loading or saving a config that repeats one fails with an error naming the duplicate and both rule indexes, a saved config with a repeat is treated as incompatible and triggers reconfiguration, and the interactive setup refuses a template already entered and asks again
 - best match per template
+- at most one click per cycle: every template is still scanned, but only one matched rule is clicked, and the other matched rules wait for the next cycle's fresh capture, so no click aims at a screen the previous click already changed
+- matched rules take turns: the next cycle searches the rules after the one it just clicked, wrapping around, so that rule goes last; when it is the only match it is clicked again, and a target that stays on screen after its click cannot keep the other rules from being clicked. A cycle that clicks nothing or fails, and the first cycle after startup, follow config order
 - one persistent wlr-screencopy connection captures the configured output, without the cursor, into a reused shared-memory buffer; each frame is converted straight to grayscale and handed to the matcher, with no external process, image encoding, or disk I/O
 - templates of a single uniform color are rejected during startup: normalized matching scores every position of every screenshot at 1.0 against them, so the runtime would click the top-left corner forever
 - runtime failures are surfaced by stage (`capture`, `OpenCV match`, `click execution`)
