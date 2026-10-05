@@ -578,3 +578,106 @@ fn consecutive_cycles_take_turns_and_reset_when_nothing_is_clicked() {
     // the rotation, so the click after them goes to the first rule again.
     assert_eq!(clicked, vec![0, 1, 0, 1, 0, 0]);
 }
+
+/// Hands out queued grayscale frames to the real capture service.
+struct ScriptedFrames(std::collections::VecDeque<Mat>);
+
+impl FrameSource for ScriptedFrames {
+    fn capture_frame(&mut self) -> anyhow::Result<Mat> {
+        self.0.pop_front().ok_or_else(|| anyhow!("no frame queued"))
+    }
+}
+
+/// Records clicked rules and requests shutdown once `stop_after` clicks landed.
+struct ShutdownAfterClicks {
+    clicked: Vec<usize>,
+    stop_after: usize,
+    shutdown_tx: std::sync::mpsc::Sender<()>,
+}
+
+impl crate::wayland_pointer::ClickExecutor for ShutdownAfterClicks {
+    fn click(&mut self, click: &crate::wayland_pointer::PlannedClick) -> anyhow::Result<()> {
+        self.clicked.push(click.rule_index);
+        if self.clicked.len() == self.stop_after {
+            self.shutdown_tx.send(()).unwrap();
+        }
+        Ok(())
+    }
+}
+
+/// A 12x12 grayscale matrix whose pixel at (`row`, `col`) is `pixel(row, col)`.
+fn pattern_mat(pixel: impl Fn(i32, i32) -> u8) -> Mat {
+    use opencv::prelude::MatTrait;
+
+    let mut mat = Mat::new_rows_cols_with_default(12, 12, CV_8UC1, Scalar::all(0.0)).unwrap();
+    for row in 0..12 {
+        for col in 0..12 {
+            *mat.at_2d_mut::<u8>(row, col).unwrap() = pixel(row, col);
+        }
+    }
+    mat
+}
+
+/// A uniform mid-gray 64x32 frame with each pattern stamped at its (left, top).
+fn frame_with(patterns: &[(&Mat, i32, i32)]) -> Mat {
+    use opencv::prelude::{MatTrait, MatTraitConst};
+
+    let mut frame = Mat::new_rows_cols_with_default(32, 64, CV_8UC1, Scalar::all(128.0)).unwrap();
+    for (pattern, left, top) in patterns {
+        for row in 0..pattern.rows() {
+            for col in 0..pattern.cols() {
+                *frame.at_2d_mut::<u8>(top + row, left + col).unwrap() =
+                    *pattern.at_2d::<u8>(row, col).unwrap();
+            }
+        }
+    }
+    frame
+}
+
+#[test]
+fn the_monitor_loop_alternates_matched_rules_and_resets_after_an_empty_frame() {
+    // Two high-contrast patterns that do not resemble each other: a vertical
+    // and a horizontal black/white split.
+    let vertical = pattern_mat(|_, col| if col < 6 { 255 } else { 0 });
+    let horizontal = pattern_mat(|row, _| if row < 6 { 255 } else { 0 });
+    let both = frame_with(&[(&vertical, 4, 4), (&horizontal, 40, 12)]);
+    let neither = frame_with(&[]);
+    let frames = [&both, &both, &both, &neither, &both, &both];
+    let source = ScriptedFrames(frames.iter().map(|frame| (*frame).clone()).collect());
+    let mut capture = CaptureService::with_source("DP-1", source);
+
+    let rule = |name: &str, template: &Mat| PreparedRule {
+        target_template: name.to_string(),
+        template_path: std::path::PathBuf::from(name),
+        template_size: (12, 12),
+        template_mat: Arc::new(template.clone()),
+    };
+    let prepared_rules = vec![rule("vertical.png", &vertical), rule("horizontal.png", &horizontal)];
+    let config = crate::config::AppConfig {
+        monitor_name: "DP-1".to_string(),
+        interval_ms: 1,
+        match_threshold: 0.9,
+        rules: vec![
+            crate::config::RuleConfig { target_template: "vertical.png".to_string() },
+            crate::config::RuleConfig { target_template: "horizontal.png".to_string() },
+        ],
+    };
+    let monitor = crate::monitor::MonitorSpec {
+        index: 1,
+        name: "DP-1".to_string(),
+        width: 64,
+        height: 32,
+        origin_x: 0,
+        origin_y: 0,
+    };
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    let mut executor = ShutdownAfterClicks { clicked: Vec::new(), stop_after: 5, shutdown_tx };
+
+    run_monitor_loop(&config, &prepared_rules, &monitor, &mut capture, &mut executor, shutdown_rx)
+        .unwrap();
+
+    // Both rules match every `both` frame, so they take turns; the frame with
+    // no match clicks nothing and restarts the turn at the first rule, even
+    // though the first rule was the one clicked just before it.
+    assert_eq!(executor.clicked, vec![0, 1, 0, 0, 1]);
+}

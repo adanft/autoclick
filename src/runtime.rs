@@ -1,4 +1,4 @@
-use crate::capture::{CaptureService, CapturedImage};
+use crate::capture::{CaptureService, CapturedImage, FrameSource};
 use crate::config::{AppConfig, RuleConfig};
 use crate::matcher::{self, MatchSet, PreparedRule};
 use crate::monitor::MonitorSpec;
@@ -51,11 +51,11 @@ impl fmt::Display for RuntimeCycleError {
 impl std::error::Error for RuntimeCycleError {}
 
 /// Runs the background monitoring loop until the user requests shutdown.
-pub fn run_monitor_loop(
+pub fn run_monitor_loop<S: FrameSource>(
     config: &AppConfig,
     prepared_rules: &[PreparedRule],
     monitor: &MonitorSpec,
-    capture: &mut CaptureService,
+    capture: &mut CaptureService<S>,
     executor: &mut impl ClickExecutor,
     shutdown_rx: Receiver<()>,
 ) -> Result<()> {
@@ -149,12 +149,12 @@ where
 }
 
 /// Executes one full runtime cycle: capture, match, evaluate rules, and click.
-pub(crate) fn run_cycle(
+pub(crate) fn run_cycle<S: FrameSource>(
     rules_config: &[RuleConfig],
     prepared_rules: &[PreparedRule],
     match_threshold: f32,
     monitor: &MonitorSpec,
-    capture: &mut CaptureService,
+    capture: &mut CaptureService<S>,
     executor: &mut impl ClickExecutor,
     previous_click: Option<usize>,
 ) -> std::result::Result<Option<PlannedClick>, RuntimeCycleError> {

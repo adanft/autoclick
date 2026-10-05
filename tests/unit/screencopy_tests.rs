@@ -188,10 +188,15 @@
             wl_shm::{self, WlShm},
             wl_shm_pool::{self, WlShmPool},
         };
+        use wayland_server::backend::GlobalId;
         use wayland_server::{
             Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource,
         };
 
+        /// The compositor-side `wl_shm` format, distinct from the client one.
+        pub use wayland_server::protocol::wl_shm::Format as ServerFormat;
+
+        #[derive(Clone)]
         pub enum Reply {
             Ready { y_invert: bool },
             Failed,
@@ -201,6 +206,12 @@
 
         pub struct Scenario {
             pub advertise_manager: bool,
+            /// Advertised manager version; below 3 there is no `buffer_done`
+            /// and no dmabuf offer.
+            pub manager_version: u32,
+            /// `wl_shm` formats offered per captured frame, in order; once
+            /// exhausted every frame offers `Xrgb8888` alone.
+            pub offers: Vec<Vec<ServerFormat>>,
             pub outputs: Vec<&'static str>,
             pub width: u32,
             pub height: u32,
@@ -225,8 +236,16 @@
             height: u32,
             stride: u32,
             pixels: Vec<u8>,
+            offers: VecDeque<Vec<ServerFormat>>,
             replies: VecDeque<Reply>,
             report: Report,
+        }
+
+        enum Command {
+            Stop,
+            /// Removes the named output's global, then acknowledges once the
+            /// `global_remove` event is flushed to the client.
+            RemoveOutput(&'static str, mpsc::Sender<()>),
         }
 
         struct BufferData {
@@ -342,15 +361,21 @@
                     state.report.captured_outputs.push(name.into());
                     state.report.overlay_cursors.push(overlay_cursor);
                     let frame = data_init.init(frame, ());
-                    // A dmabuf offer first: the client must skip it for the shm one.
-                    frame.linux_dmabuf(0x3432_5258, state.width, state.height);
-                    frame.buffer(
-                        wl_shm::Format::Xrgb8888,
-                        state.width,
-                        state.height,
-                        state.stride,
-                    );
-                    frame.buffer_done();
+                    let has_buffer_done = frame.version() >= 3;
+                    if has_buffer_done {
+                        // A dmabuf offer first: the client must skip it for the shm one.
+                        frame.linux_dmabuf(0x3432_5258, state.width, state.height);
+                    }
+                    let formats = state
+                        .offers
+                        .pop_front()
+                        .unwrap_or_else(|| vec![ServerFormat::Xrgb8888]);
+                    for format in formats {
+                        frame.buffer(format, state.width, state.height, state.stride);
+                    }
+                    if has_buffer_done {
+                        frame.buffer_done();
+                    }
                 }
             }
         }
@@ -393,23 +418,30 @@
         }
 
         pub struct FakeCompositor {
-            stop: mpsc::Sender<()>,
+            commands: mpsc::Sender<Command>,
             thread: JoinHandle<Report>,
         }
 
         impl FakeCompositor {
             pub fn spawn(scenario: Scenario) -> (Self, Connection) {
                 let (client, server) = UnixStream::pair().unwrap();
-                let (stop, stopped) = mpsc::channel();
+                let (commands, received) = mpsc::channel();
                 let thread = thread::spawn(move || {
                     let mut display = Display::<ServerState>::new().unwrap();
                     let mut handle = display.handle();
                     handle.create_global::<ServerState, WlShm, _>(1, ());
-                    for name in scenario.outputs {
-                        handle.create_global::<ServerState, WlOutput, _>(4, name);
-                    }
+                    let outputs: Vec<(&'static str, GlobalId)> = scenario
+                        .outputs
+                        .into_iter()
+                        .map(|name| {
+                            (name, handle.create_global::<ServerState, WlOutput, _>(4, name))
+                        })
+                        .collect();
                     if scenario.advertise_manager {
-                        handle.create_global::<ServerState, ZwlrScreencopyManagerV1, _>(3, ());
+                        handle.create_global::<ServerState, ZwlrScreencopyManagerV1, _>(
+                            scenario.manager_version,
+                            (),
+                        );
                     }
                     server.set_nonblocking(true).unwrap();
                     handle.insert_client(server, Arc::new(())).unwrap();
@@ -418,10 +450,21 @@
                         height: scenario.height,
                         stride: scenario.stride,
                         pixels: scenario.pixels,
+                        offers: scenario.offers.into(),
                         replies: scenario.replies.into(),
                         report: Report::default(),
                     };
-                    while let Err(mpsc::TryRecvError::Empty) = stopped.try_recv() {
+                    loop {
+                        match received.try_recv() {
+                            Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => break,
+                            Ok(Command::RemoveOutput(name, ack)) => {
+                                let (_, id) = outputs.iter().find(|(n, _)| *n == name).unwrap();
+                                handle.remove_global::<ServerState>(id.clone());
+                                display.flush_clients().unwrap();
+                                ack.send(()).unwrap();
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {}
+                        }
                         if display.dispatch_clients(&mut state).is_ok() {
                             display.flush_clients().unwrap();
                         } else {
@@ -430,22 +473,34 @@
                     }
                     state.report
                 });
-                (Self { stop, thread }, Connection::from_socket(client).unwrap())
+                (Self { commands, thread }, Connection::from_socket(client).unwrap())
+            }
+
+            /// Removes the named output's global and returns once the client
+            /// has been sent `global_remove`; a later roundtrip delivers it.
+            pub fn remove_output(&self, name: &'static str) {
+                let (ack, acked) = mpsc::channel();
+                self.commands
+                    .send(Command::RemoveOutput(name, ack))
+                    .unwrap();
+                acked.recv().unwrap();
             }
 
             pub fn finish(self) -> Report {
-                self.stop.send(()).unwrap();
+                self.commands.send(Command::Stop).unwrap();
                 self.thread.join().unwrap()
             }
         }
     }
 
-    use fake::{FakeCompositor, Reply, Report, Scenario};
+    use fake::{FakeCompositor, Reply, Report, Scenario, ServerFormat};
 
     /// A 3x2 Xrgb8888 frame with four bytes of row padding.
     fn padded_scenario(replies: Vec<Reply>) -> Scenario {
         Scenario {
             advertise_manager: true,
+            manager_version: 3,
+            offers: Vec::new(),
             outputs: vec!["DP-1", "HDMI-A-1"],
             width: 3,
             height: 2,
@@ -562,6 +617,119 @@
         );
         let report = compositor.finish();
         assert_eq!((report.pools, report.copies, report.frames_destroyed), (1, 2, 2));
+    }
+
+    #[test]
+    fn a_pre_v3_manager_captures_from_its_single_buffer_offer() {
+        // Before v3 there is no `buffer_done`: the lone `buffer` event closes
+        // the offer, so waiting for `buffer_done` would stall until the timeout.
+        for manager_version in [1, 2] {
+            let (compositor, connection) = FakeCompositor::spawn(Scenario {
+                manager_version,
+                ..padded_scenario(vec![Reply::Ready { y_invert: false }])
+            });
+            let mut client = ScreencopyClient::from_connection(connection, "HDMI-A-1").unwrap();
+            client.frame_timeout = std::time::Duration::from_millis(500);
+
+            let gray = client.capture().unwrap();
+            settle(&mut client);
+
+            assert_eq!(client.manager.version(), manager_version);
+            assert_eq!(gray_rows(&gray), vec![TOP_ROW.to_vec(), BOTTOM_ROW.to_vec()]);
+            let report = compositor.finish();
+            assert_eq!((report.pools, report.copies, report.frames_destroyed), (1, 1, 1));
+        }
+    }
+
+    #[test]
+    fn a_frame_offering_only_unsupported_formats_fails_fast_and_the_next_succeeds() {
+        // A v3 frame may offer several formats before `buffer_done`; a pre-v3
+        // frame offers exactly one.
+        let cases = [
+            (3, vec![ServerFormat::Rgb565, ServerFormat::Rgb888]),
+            (1, vec![ServerFormat::Rgb565]),
+        ];
+        for (manager_version, unsupported) in cases {
+            let (compositor, connection) = FakeCompositor::spawn(Scenario {
+                manager_version,
+                offers: vec![unsupported],
+                ..padded_scenario(vec![Reply::Ready { y_invert: false }])
+            });
+            let mut client = ScreencopyClient::from_connection(connection, "HDMI-A-1").unwrap();
+
+            let started = std::time::Instant::now();
+            let error = client.capture().unwrap_err();
+            let waited = started.elapsed();
+            let recovered = client.capture().unwrap();
+            settle(&mut client);
+
+            let message = error.to_string();
+            assert!(
+                message.starts_with("the compositor offered no supported wl_shm screencopy format")
+                    && message.contains("Rgb565"),
+                "unexpected error for v{manager_version}: {message}"
+            );
+            assert!(
+                waited < client.frame_timeout / 4,
+                "v{manager_version} failed after {waited:?}"
+            );
+            assert_eq!(
+                gray_rows(&recovered),
+                vec![TOP_ROW.to_vec(), BOTTOM_ROW.to_vec()]
+            );
+            // The rejected frame is destroyed without ever being copied.
+            let report = compositor.finish();
+            assert_eq!((report.pools, report.copies, report.frames_destroyed), (1, 1, 2));
+        }
+    }
+
+    #[test]
+    fn removing_the_selected_output_fails_every_later_capture_fast() {
+        let (compositor, connection) =
+            FakeCompositor::spawn(padded_scenario(vec![Reply::Ready { y_invert: false }; 3]));
+        let mut client = ScreencopyClient::from_connection(connection, "HDMI-A-1").unwrap();
+        client.capture().unwrap();
+
+        compositor.remove_output("HDMI-A-1");
+        settle(&mut client);
+
+        for attempt in 1..=2 {
+            let started = std::time::Instant::now();
+            let error = client.capture().unwrap_err();
+            let waited = started.elapsed();
+
+            assert_eq!(error.to_string(), "Wayland output HDMI-A-1 was removed");
+            assert!(
+                waited < client.frame_timeout / 4,
+                "attempt {attempt} failed after {waited:?}"
+            );
+        }
+        settle(&mut client);
+        // Nothing is requested for the removed output after its removal.
+        let report = compositor.finish();
+        assert_eq!(report.captured_outputs, vec!["HDMI-A-1".to_string()]);
+        assert_eq!((report.copies, report.frames_destroyed), (1, 1));
+    }
+
+    #[test]
+    fn removing_another_output_leaves_capture_working() {
+        let (compositor, connection) =
+            FakeCompositor::spawn(padded_scenario(vec![Reply::Ready { y_invert: false }; 2]));
+        let mut client = ScreencopyClient::from_connection(connection, "HDMI-A-1").unwrap();
+        client.capture().unwrap();
+
+        compositor.remove_output("DP-1");
+        settle(&mut client);
+        let gray = client.capture().unwrap();
+        settle(&mut client);
+
+        assert_eq!(gray_rows(&gray), vec![TOP_ROW.to_vec(), BOTTOM_ROW.to_vec()]);
+        let report = compositor.finish();
+        assert_eq!(
+            report.captured_outputs,
+            vec!["HDMI-A-1".to_string(), "HDMI-A-1".to_string()]
+        );
+        assert_eq!(report.copies, 2);
     }
 
     #[test]
