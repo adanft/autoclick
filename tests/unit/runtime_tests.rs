@@ -83,15 +83,97 @@ fn evaluates_multiple_rules_from_same_match_set_in_order() {
     assert_eq!(planned[1].rule_index, 1);
 }
 
-#[test]
-fn loop_stops_when_shutdown_signal_arrives() {
-    let (tx, rx) = std::sync::mpsc::channel();
-    tx.send(()).unwrap();
+fn capture_failure(message: &'static str) -> RuntimeCycleError {
+    RuntimeCycleError::Capture(anyhow!(message))
+}
 
-    match rx.recv_timeout(std::time::Duration::from_millis(1)) {
-        Ok(()) => {}
-        other => panic!("expected immediate shutdown signal, got {other:?}"),
-    }
+#[test]
+fn loop_stops_promptly_when_shutdown_arrives_during_the_interval_wait() {
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    let (cycle_tx, cycle_rx) = std::sync::mpsc::channel();
+    let requester = std::thread::spawn(move || {
+        cycle_rx.recv().unwrap();
+        shutdown_tx.send(()).unwrap();
+    });
+    let mut calls = 0_usize;
+
+    let started = std::time::Instant::now();
+    run_monitor_loop_with_runner(60_000, shutdown_rx, || {
+        calls += 1;
+        cycle_tx.send(()).unwrap();
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(calls, 1);
+    requester.join().unwrap();
+}
+
+#[test]
+fn stops_after_too_many_consecutive_non_click_failures() {
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let mut calls = 0_usize;
+
+    let error = run_monitor_loop_with_runner(1, rx, || {
+        calls += 1;
+        if calls == MAX_CONSECUTIVE_CYCLE_FAILURES {
+            return Err(capture_failure("Wayland output HDMI-A-1 was removed"));
+        }
+        Err(match_failure("temporary matcher failure"))
+    })
+    .unwrap_err();
+
+    assert_eq!(calls, MAX_CONSECUTIVE_CYCLE_FAILURES);
+    assert_eq!(
+        format!("{error:#}"),
+        format!(
+            "monitor loop stopped after {MAX_CONSECUTIVE_CYCLE_FAILURES} consecutive failed \
+             cycles, last in stage capture: capture failed: Wayland output HDMI-A-1 was removed"
+        )
+    );
+}
+
+#[test]
+fn a_successful_cycle_resets_the_consecutive_failure_count() {
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let mut calls = 0_usize;
+
+    run_monitor_loop_with_runner(1, rx, || {
+        calls += 1;
+        // One short of the limit, then a success, then failures until it stops.
+        if calls == MAX_CONSECUTIVE_CYCLE_FAILURES {
+            return Ok(());
+        }
+        Err(match_failure("temporary matcher failure"))
+    })
+    .unwrap_err();
+
+    assert_eq!(calls, 2 * MAX_CONSECUTIVE_CYCLE_FAILURES);
+}
+
+#[test]
+fn click_failure_stops_immediately_even_after_earlier_skipped_cycles() {
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let mut calls = 0_usize;
+
+    let error = run_monitor_loop_with_runner(1, rx, || {
+        calls += 1;
+        if calls == 2 {
+            return Err(click_failure("Wayland virtual pointer disconnected"));
+        }
+        Err(match_failure("temporary matcher failure"))
+    })
+    .unwrap_err();
+
+    assert_eq!(calls, 2);
+    assert!(error
+        .to_string()
+        .contains("monitor loop stopped because click injection failed"));
 }
 
 #[test]

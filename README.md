@@ -98,14 +98,18 @@ Important:
 cargo run
 ```
 
-Logs go to `stderr`. By default the program stays quiet unless there is an error.
+Logs go to `stderr`. By default only warnings and errors are shown, so every
+skipped monitor cycle is reported with its stage and cause.
 
 ```bash
 RUST_LOG=info cargo run
 RUST_LOG=debug cargo run
 ```
 
-The process keeps running until you press `q` and then `Enter`, or send `SIGINT` / `SIGTERM`.
+The process keeps running until you press `q` and then `Enter`, or send `SIGINT` / `SIGTERM`
+(for example with Ctrl+C). The first signal asks the monitor loop to stop after the
+current cycle. A second signal exits immediately with status 130, without waiting
+for the cycle to finish.
 
 ## Config Shape
 
@@ -133,6 +137,9 @@ Current behavior:
 - one persistent wlr-screencopy connection captures the configured output, without the cursor, into a reused shared-memory buffer; each frame is converted straight to grayscale and handed to the matcher, with no external process, image encoding, or disk I/O
 - templates of a single uniform color are rejected during startup: normalized matching scores every position of every screenshot at 1.0 against them, so the runtime would click the top-left corner forever
 - runtime failures are surfaced by stage (`capture`, `OpenCV match`, `click execution`)
+- a failed capture or match skips that cycle with a warning; after 5 consecutive skipped cycles the loop stops with an error naming the last stage and its cause, and any successful cycle resets the count
+- a click failure stops the loop immediately
+- a screencopy frame the compositor does not finish within 2 seconds fails that capture, so a stalled compositor cannot block the loop
 - one persistent, output-bound Wayland virtual pointer sends absolute motion, left-button press, and left-button release directly from the process
 - each click is a synchronous framed transaction on one Wayland connection: it validates once on the way in, queues motion, press and release, and flushes them in a single write closed by one protocol round trip, so press and release reach the compositor together
 - invalidation or delivery failures stop the transaction instead of falling back to another input path

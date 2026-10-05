@@ -2,10 +2,15 @@ use anyhow::{anyhow, bail, Context, Result};
 use opencv::core::{self, Mat, Rect, Vec4b};
 use opencv::imgproc;
 use opencv::prelude::*;
+use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::io::Errno;
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::ErrorKind;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
+use std::time::{Duration, Instant};
+use wayland_client::backend::{ReadEventsGuard, WaylandError};
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
     wl_output::{self, WlOutput},
@@ -27,6 +32,14 @@ const MAX_MANAGER_VERSION: u32 = 3;
 
 /// First `wl_output` version carrying the connector `name` event.
 const OUTPUT_NAME_VERSION: u32 = 4;
+
+/// Longest a capture waits for the compositor to finish one frame.
+///
+/// A healthy frame completes within a few refresh periods. One the compositor
+/// never answers would otherwise block the monitor loop, and with it shutdown,
+/// forever; two seconds is far beyond any normal frame yet still short enough
+/// that a stalled compositor surfaces as a capture error within one cycle.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Pixel layout of a `wl_shm` frame as announced by the screencopy `buffer` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +342,7 @@ pub struct ScreencopyClient {
     buffer: Option<ShmBuffer>,
     pixels: Vec<u8>,
     next_serial: u64,
+    frame_timeout: Duration,
 }
 
 impl ScreencopyClient {
@@ -385,16 +399,19 @@ impl ScreencopyClient {
             buffer: None,
             pixels: Vec::new(),
             next_serial: 0,
+            frame_timeout: FRAME_TIMEOUT,
         })
     }
 
     /// Captures the selected output, without the cursor, as a grayscale matrix.
     ///
-    /// A failed frame is destroyed and reported; the next call starts a fresh one.
+    /// A failed frame, or one not finished within [`FRAME_TIMEOUT`], is destroyed
+    /// and reported; the next call starts a fresh one.
     pub fn capture(&mut self) -> Result<Mat> {
         if self.state.selected_output_removed {
             bail!("Wayland output {} was removed", self.connector);
         }
+        let deadline = Instant::now() + self.frame_timeout;
         self.next_serial += 1;
         self.state.frame = FrameState::new(self.next_serial);
         let frame = self.manager.capture_output(
@@ -403,7 +420,7 @@ impl ScreencopyClient {
             &self.event_queue.handle(),
             self.next_serial,
         );
-        let captured = self.copy_frame(&frame);
+        let captured = self.copy_frame(&frame, deadline);
         frame.destroy();
         let flushed = self
             .connection
@@ -414,9 +431,9 @@ impl ScreencopyClient {
         Ok(image)
     }
 
-    fn copy_frame(&mut self, frame: &ZwlrScreencopyFrameV1) -> Result<Mat> {
+    fn copy_frame(&mut self, frame: &ZwlrScreencopyFrameV1, deadline: Instant) -> Result<Mat> {
         let has_buffer_done = frame.version() >= 3;
-        self.dispatch_until(|frame| {
+        self.dispatch_until(deadline, |frame| {
             frame.outcome.is_some() || frame.offer_complete(has_buffer_done)
         })?;
         if self.state.frame.outcome.is_some() {
@@ -430,7 +447,7 @@ impl ScreencopyClient {
         })?;
 
         frame.copy(&self.reusable_buffer(layout)?.buffer);
-        self.dispatch_until(|frame| frame.outcome.is_some())?;
+        self.dispatch_until(deadline, |frame| frame.outcome.is_some())?;
         if let Some(FrameOutcome::Failed) = self.state.frame.outcome {
             bail!("the compositor reported the screencopy frame as failed");
         }
@@ -465,13 +482,61 @@ impl ScreencopyClient {
             .context("screencopy shm buffer is unavailable")
     }
 
-    fn dispatch_until(&mut self, done: impl Fn(&FrameState) -> bool) -> Result<()> {
-        while !done(&self.state.frame) {
+    /// Dispatches frame events until `done` holds or `deadline` passes.
+    ///
+    /// `blocking_dispatch` would wait on the socket with no bound, so this
+    /// polls the connection fd with the time left instead.
+    fn dispatch_until(
+        &mut self,
+        deadline: Instant,
+        done: impl Fn(&FrameState) -> bool,
+    ) -> Result<()> {
+        loop {
             self.event_queue
-                .blocking_dispatch(&mut self.state)
+                .dispatch_pending(&mut self.state)
                 .context("Wayland dispatch failed while waiting for a screencopy frame")?;
+            if done(&self.state.frame) {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!(
+                    "screencopy frame for output {} did not complete within {} ms",
+                    self.connector,
+                    self.frame_timeout.as_millis()
+                );
+            }
+            self.event_queue
+                .flush()
+                .context("failed to flush screencopy requests")?;
+            // `None` means events are already queued: dispatch them first.
+            if let Some(guard) = self.event_queue.prepare_read() {
+                if wait_readable(&guard, remaining)? {
+                    match guard.read() {
+                        Ok(_) => {}
+                        Err(WaylandError::Io(error)) if error.kind() == ErrorKind::WouldBlock => {}
+                        Err(error) => {
+                            return Err(error)
+                                .context("failed to read Wayland events for a screencopy frame")
+                        }
+                    }
+                }
+            }
         }
-        Ok(())
+    }
+}
+
+/// Waits until the connection fd is readable or `timeout` elapses, returning
+/// whether it became readable. An interrupted wait reports not readable so the
+/// caller rechecks its deadline.
+fn wait_readable(guard: &ReadEventsGuard, timeout: Duration) -> Result<bool> {
+    let fd = guard.connection_fd();
+    let mut fds = [PollFd::new(&fd, PollFlags::IN | PollFlags::ERR)];
+    let timeout = Timespec::try_from(timeout).context("screencopy timeout out of range")?;
+    match rustix::event::poll(&mut fds, Some(&timeout)) {
+        Ok(ready) => Ok(ready > 0),
+        Err(Errno::INTR) => Ok(false),
+        Err(error) => Err(error).context("failed to poll the Wayland connection"),
     }
 }
 

@@ -17,9 +17,10 @@ pub mod runtime;
 pub mod screencopy;
 pub mod wayland_pointer;
 
-/// Initializes stderr logging with `RUST_LOG`, defaulting to errors only.
+/// Initializes stderr logging with `RUST_LOG`, defaulting to warnings and errors
+/// so a skipped monitor cycle is visible without extra configuration.
 pub fn init_logging() {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)

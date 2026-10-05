@@ -11,6 +11,14 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// Consecutive capture or match failures after which the loop gives up.
+///
+/// A single bad frame recovers on the next cycle, but a dead compositor
+/// connection or a removed output fails every cycle and would otherwise keep
+/// the process alive without ever clicking. Five in a row rides out a brief
+/// stall yet stops within seconds, since a capture waits at most two seconds.
+const MAX_CONSECUTIVE_CYCLE_FAILURES: usize = 5;
+
 #[derive(Debug)]
 pub(crate) enum RuntimeCycleError {
     Capture(Error),
@@ -73,6 +81,7 @@ where
     F: FnMut() -> std::result::Result<(), RuntimeCycleError>,
 {
     let interval = Duration::from_millis(interval_ms);
+    let mut consecutive_failures = 0_usize;
 
     loop {
         if shutdown_rx.try_recv().is_ok() {
@@ -82,13 +91,25 @@ where
 
         let cycle_started = Instant::now();
         match run_cycle() {
-            Ok(_) => {}
+            Ok(_) => consecutive_failures = 0,
+            Err(error @ RuntimeCycleError::Click(_)) => {
+                return Err(error).context("monitor loop stopped because click injection failed");
+            }
             Err(error) => {
-                if matches!(error, RuntimeCycleError::Click(_)) {
-                    return Err(error)
-                        .context("monitor loop stopped because click injection failed");
+                consecutive_failures += 1;
+                let stage = error.stage_label();
+                if consecutive_failures >= MAX_CONSECUTIVE_CYCLE_FAILURES {
+                    return Err(error).context(format!(
+                        "monitor loop stopped after {consecutive_failures} consecutive failed \
+                         cycles, last in stage {stage}"
+                    ));
                 }
-                warn!(stage = error.stage_label(), error = %error, "cycle skipped after runtime failure");
+                warn!(
+                    stage,
+                    consecutive_failures,
+                    error = %error,
+                    "cycle skipped after runtime failure"
+                );
             }
         }
 

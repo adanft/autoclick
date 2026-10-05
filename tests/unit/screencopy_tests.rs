@@ -195,6 +195,8 @@
         pub enum Reply {
             Ready { y_invert: bool },
             Failed,
+            /// Never answers the copy, like a stalled compositor.
+            Silent,
         }
 
         pub struct Scenario {
@@ -378,6 +380,7 @@
                                 });
                                 frame.ready(0, 0, 0);
                             }
+                            Some(Reply::Silent) => {}
                             Some(Reply::Failed) | None => frame.failed(),
                         }
                     }
@@ -520,6 +523,38 @@
         assert!(
             error.to_string().contains("screencopy frame as failed"),
             "unexpected error: {error}"
+        );
+        assert_eq!(
+            gray_rows(&recovered),
+            vec![TOP_ROW.to_vec(), BOTTOM_ROW.to_vec()]
+        );
+        let report = compositor.finish();
+        assert_eq!((report.pools, report.copies, report.frames_destroyed), (1, 2, 2));
+    }
+
+    #[test]
+    fn a_frame_that_never_completes_times_out_and_the_next_capture_succeeds() {
+        let (compositor, connection) = FakeCompositor::spawn(padded_scenario(vec![
+            Reply::Silent,
+            Reply::Ready { y_invert: false },
+        ]));
+        let mut client = ScreencopyClient::from_connection(connection, "HDMI-A-1").unwrap();
+        client.frame_timeout = std::time::Duration::from_millis(100);
+
+        let started = std::time::Instant::now();
+        let error = client.capture().unwrap_err();
+        let waited = started.elapsed();
+        let recovered = client.capture().unwrap();
+        settle(&mut client);
+
+        assert_eq!(
+            error.to_string(),
+            "screencopy frame for output HDMI-A-1 did not complete within 100 ms"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(100)
+                && waited < std::time::Duration::from_secs(2),
+            "timed out after {waited:?}"
         );
         assert_eq!(
             gray_rows(&recovered),
