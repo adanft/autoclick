@@ -1,7 +1,8 @@
+use crate::matcher::ColorStats;
 use crate::screencopy::ScreencopyClient;
 use crate::wayland_pointer::ImageExtent;
 use anyhow::{bail, Context, Result};
-use opencv::core::Mat;
+use opencv::core::{Mat, Rect};
 use opencv::prelude::*;
 
 /// A screenshot proven to have positive dimensions at the capture seam.
@@ -27,17 +28,26 @@ impl CapturedImage {
     }
 }
 
-/// Produces grayscale frames of one output.
+/// Produces grayscale frames of one output, and samples the color of the last.
 ///
 /// The seam between the capture service and the compositor, so the service can
 /// be exercised without a Wayland session.
 pub trait FrameSource {
     fn capture_frame(&mut self) -> Result<Mat>;
+
+    /// Mean color and luminance spread of `region` of the last captured frame,
+    /// in the coordinates of its grayscale matrix. Fails when the last capture
+    /// failed or none ran yet.
+    fn region_stats(&self, region: Rect) -> Result<ColorStats>;
 }
 
 impl FrameSource for ScreencopyClient {
     fn capture_frame(&mut self) -> Result<Mat> {
         self.capture()
+    }
+
+    fn region_stats(&self, region: Rect) -> Result<ColorStats> {
+        ScreencopyClient::region_stats(self, region)
     }
 }
 
@@ -73,5 +83,12 @@ impl<S: FrameSource> CaptureService<S> {
             .capture_frame()
             .with_context(|| format!("failed to capture output {}", self.connector))?;
         CapturedImage::from_decoded(image).context("captured screenshot has no usable extent")
+    }
+
+    /// Samples the colors of `region` in the last captured screenshot.
+    pub fn region_stats(&self, region: Rect) -> Result<ColorStats> {
+        self.source
+            .region_stats(region)
+            .with_context(|| format!("failed to sample output {}", self.connector))
     }
 }

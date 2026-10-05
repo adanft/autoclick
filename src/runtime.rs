@@ -6,6 +6,7 @@ use crate::rules;
 use crate::wayland_pointer::{ClickExecutor, ImageExtent, PlannedClick};
 use anyhow::{Context, Error, Result};
 use opencv::core::Mat;
+use std::cell::RefCell;
 use std::fmt;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -148,7 +149,8 @@ where
     Ok(())
 }
 
-/// Executes one full runtime cycle: capture, match, evaluate rules, and click.
+/// Executes one full runtime cycle: capture, match, verify colors, evaluate
+/// rules, and click.
 pub(crate) fn run_cycle<S: FrameSource>(
     rules_config: &[RuleConfig],
     prepared_rules: &[PreparedRule],
@@ -158,16 +160,25 @@ pub(crate) fn run_cycle<S: FrameSource>(
     executor: &mut impl ClickExecutor,
     previous_click: Option<usize>,
 ) -> std::result::Result<Option<PlannedClick>, RuntimeCycleError> {
+    // Capturing needs the service mutably and the color check after matching
+    // reads the frame it kept; the two closures run one after the other.
+    let capture = RefCell::new(capture);
     run_cycle_with(
         rules_config,
         prepared_rules,
         match_threshold,
         monitor,
-        || capture.capture_monitor(),
+        || capture.borrow_mut().capture_monitor(),
         |screenshot, threshold| {
-            matcher::scan_all(screenshot, prepared_rules, threshold).with_context(|| {
-                format!("OpenCV matching failed at threshold {:.2}", match_threshold)
-            })
+            let mut matches = matcher::scan_all(screenshot, prepared_rules, threshold)
+                .with_context(|| {
+                    format!("OpenCV matching failed at threshold {:.2}", match_threshold)
+                })?;
+            let capture = capture.borrow();
+            matcher::verify_colors(&mut matches, prepared_rules, |region| {
+                capture.region_stats(region)
+            })?;
+            Ok(matches)
         },
         |matches, extent| {
             execute_match_set(rules_config, extent, matches, previous_click, executor)

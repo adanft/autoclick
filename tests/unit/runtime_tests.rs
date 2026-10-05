@@ -10,6 +10,7 @@ fn prepared_rule(target_template: &str, template_path: &str) -> PreparedRule {
         template_mat: std::sync::Arc::new(
             Mat::new_rows_cols_with_default(10, 20, CV_8UC1, Scalar::all(255.0)).unwrap(),
         ),
+        template_colors: crate::matcher::ColorStats { mean_bgr: [255.0; 3], luma_std: 0.0 },
     }
 }
 
@@ -579,13 +580,43 @@ fn consecutive_cycles_take_turns_and_reset_when_nothing_is_clicked() {
     assert_eq!(clicked, vec![0, 1, 0, 1, 0, 0]);
 }
 
-/// Hands out queued grayscale frames to the real capture service.
-struct ScriptedFrames(std::collections::VecDeque<Mat>);
+/// Hands out queued grayscale frames to the real capture service, sampling
+/// regions of the last one as gray pixels.
+struct ScriptedFrames {
+    queued: std::collections::VecDeque<Mat>,
+    last: Option<Mat>,
+}
 
 impl FrameSource for ScriptedFrames {
     fn capture_frame(&mut self) -> anyhow::Result<Mat> {
-        self.0.pop_front().ok_or_else(|| anyhow!("no frame queued"))
+        let frame = self.queued.pop_front().ok_or_else(|| anyhow!("no frame queued"))?;
+        self.last = Some(frame.clone());
+        Ok(frame)
     }
+
+    fn region_stats(&self, region: Rect) -> anyhow::Result<ColorStats> {
+        sample_region(self.last.as_ref(), region)
+    }
+}
+
+/// Serves one BGR screen, as grayscale to the matcher and in color to the check.
+struct ColorScreen(Mat);
+
+impl FrameSource for ColorScreen {
+    fn capture_frame(&mut self) -> anyhow::Result<Mat> {
+        Ok(crate::support::to_gray(&self.0))
+    }
+
+    fn region_stats(&self, region: Rect) -> anyhow::Result<ColorStats> {
+        sample_region(Some(&self.0), region)
+    }
+}
+
+fn sample_region(frame: Option<&Mat>, region: Rect) -> anyhow::Result<ColorStats> {
+    use opencv::prelude::MatTraitConst;
+
+    let frame = frame.ok_or_else(|| anyhow!("no captured frame"))?;
+    crate::matcher::mat_color_stats(&frame.roi(region)?)
 }
 
 /// Records clicked rules and requests shutdown once `stop_after` clicks landed.
@@ -643,7 +674,10 @@ fn the_monitor_loop_alternates_matched_rules_and_resets_after_an_empty_frame() {
     let both = frame_with(&[(&vertical, 4, 4), (&horizontal, 40, 12)]);
     let neither = frame_with(&[]);
     let frames = [&both, &both, &both, &neither, &both, &both];
-    let source = ScriptedFrames(frames.iter().map(|frame| (*frame).clone()).collect());
+    let source = ScriptedFrames {
+        queued: frames.iter().map(|frame| (*frame).clone()).collect(),
+        last: None,
+    };
     let mut capture = CaptureService::with_source("DP-1", source);
 
     let rule = |name: &str, template: &Mat| PreparedRule {
@@ -651,6 +685,7 @@ fn the_monitor_loop_alternates_matched_rules_and_resets_after_an_empty_frame() {
         template_path: std::path::PathBuf::from(name),
         template_size: (12, 12),
         template_mat: Arc::new(template.clone()),
+        template_colors: crate::matcher::mat_color_stats(template).unwrap(),
     };
     let prepared_rules = vec![rule("vertical.png", &vertical), rule("horizontal.png", &horizontal)];
     let config = crate::config::AppConfig {
@@ -680,4 +715,44 @@ fn the_monitor_loop_alternates_matched_rules_and_resets_after_an_empty_frame() {
     // no match clicks nothing and restarts the turn at the first rule, even
     // though the first rule was the one clicked just before it.
     assert_eq!(executor.clicked, vec![0, 1, 0, 0, 1]);
+}
+
+#[test]
+fn a_gray_match_that_fails_the_color_check_plans_no_click_and_the_cycle_succeeds() {
+    use crate::support::{blend_toward, button, map_pixels, screen_with, to_gray};
+    use crate::support::{BUTTON_FILL, BUTTON_TEXT, SCREEN_BACKGROUND};
+
+    let exact = button(BUTTON_FILL, BUTTON_TEXT);
+    let dimmed = map_pixels(&exact, |pixel| blend_toward(pixel, 128, 0.4));
+    let rules = vec![crate::config::RuleConfig { target_template: "button.png".to_string() }];
+    let prepared_rules = vec![PreparedRule {
+        target_template: "button.png".to_string(),
+        template_path: std::path::PathBuf::from("button.png"),
+        template_size: (24, 12),
+        template_mat: Arc::new(to_gray(&exact)),
+        template_colors: crate::matcher::mat_color_stats(&exact).unwrap(),
+    }];
+    let monitor = crate::monitor::MonitorSpec {
+        index: 1,
+        name: "DP-1".to_string(),
+        width: 80,
+        height: 40,
+        origin_x: 0,
+        origin_y: 0,
+    };
+    let mut executor = RecordingExecutor::default();
+    let mut cycle = |screen: &Mat| {
+        let mut capture = CaptureService::with_source(
+            "DP-1",
+            ColorScreen(screen_with(80, 40, SCREEN_BACKGROUND, screen, 30, 14)),
+        );
+        run_cycle(&rules, &prepared_rules, 0.9, &monitor, &mut capture, &mut executor, None)
+    };
+
+    let dimmed_outcome = cycle(&dimmed).unwrap();
+    let exact_outcome = cycle(&exact).unwrap();
+
+    assert_eq!(dimmed_outcome, None);
+    assert_eq!(exact_outcome.map(|click| (click.output_x, click.output_y)), Some((42, 20)));
+    assert_eq!(executor.clicks.len(), 1);
 }

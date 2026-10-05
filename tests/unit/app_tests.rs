@@ -117,6 +117,7 @@ fn startup_summary_contains_key_runtime_fields() {
         template_path: "/tmp/autoclick/templates/accept_button.png".into(),
         template_size: (48, 20),
         template_mat: prepared_template_mat(48, 20),
+        template_colors: crate::matcher::ColorStats { mean_bgr: [255.0; 3], luma_std: 0.0 },
     }];
     let monitor = crate::monitor::MonitorSpec {
         index: 1,
@@ -157,6 +158,7 @@ fn startup_summary_omits_redundant_background_mode_copy() {
         template_path: "/tmp/autoclick/templates/accept_button.png".into(),
         template_size: (48, 20),
         template_mat: prepared_template_mat(48, 20),
+        template_colors: crate::matcher::ColorStats { mean_bgr: [255.0; 3], luma_std: 0.0 },
     }];
     let monitor = crate::monitor::MonitorSpec {
         index: 1,

@@ -169,6 +169,72 @@
         }
     }
 
+    #[test]
+    fn samples_region_colors_top_down_for_every_channel_order() {
+        const BLACK: [u8; 4] = [0, 0, 0, 0];
+        const GRAY_100: [u8; 4] = [100, 100, 100, 0];
+        let bgrx = [[BGRX_RED, BGRX_GREEN, BGRX_BLUE], [WHITE, BLACK, GRAY_100]];
+        let rgbx = bgrx.map(|row| row.map(|[b, g, r, x]| [r, g, b, x]));
+        let right_of_top_row = Rect::new(1, 0, 2, 1);
+
+        for (format, rows) in [
+            (Format::Xrgb8888, bgrx),
+            (Format::Argb8888, bgrx),
+            (Format::Xbgr8888, rgbx),
+            (Format::Abgr8888, rgbx),
+        ] {
+            // Three pixels per row plus four padding bytes.
+            let pixels = frame_bytes(&[&rows[0], &rows[1]], 4);
+            let frame = layout(format, 3, 2, 16);
+
+            let upright = shm_region_stats(&pixels, &frame, false, right_of_top_row).unwrap();
+            let inverted = shm_region_stats(&pixels, &frame, true, right_of_top_row).unwrap();
+
+            // Green and blue: luma 150 and 29.
+            assert_eq!(upright.mean_bgr, [127.5, 127.5, 0.0], "{format:?}");
+            assert_eq!(upright.luma_std, 60.5, "{format:?}");
+            // A y-inverted frame stores the top row last: black and gray 100.
+            assert_eq!(inverted.mean_bgr, [50.0; 3], "{format:?}");
+            assert_eq!(inverted.luma_std, 50.0, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn region_luma_spread_equals_the_grayscale_frame() {
+        let pixels = frame_bytes(&[&[BGRX_RED, BGRX_GREEN], &[BGRX_BLUE, WHITE]], 4);
+        let frame = layout(Format::Xrgb8888, 2, 2, 12);
+        let gray = shm_frame_to_grayscale(&pixels, &frame, true).unwrap();
+
+        let stats = shm_region_stats(&pixels, &frame, true, Rect::new(0, 0, 2, 2)).unwrap();
+
+        let mut mean = Mat::default();
+        let mut stddev = Mat::default();
+        core::mean_std_dev(&gray, &mut mean, &mut stddev, &core::no_array()).unwrap();
+        assert_eq!(stats.luma_std, *stddev.at_2d::<f64>(0, 0).unwrap());
+        assert_eq!(stats.mean_bgr, [127.5, 127.5, 127.5]);
+    }
+
+    #[test]
+    fn rejects_regions_outside_the_frame_or_without_pixels() {
+        let pixels = frame_bytes(&[&[BGRX_RED, BGRX_GREEN], &[BGRX_BLUE, WHITE]], 0);
+        let frame = layout(Format::Xrgb8888, 2, 2, 8);
+
+        for region in [
+            Rect::new(1, 1, 2, 1),
+            Rect::new(-1, 0, 1, 1),
+            Rect::new(0, 0, 0, 1),
+            Rect::new(i32::MAX, 0, 1, 1),
+        ] {
+            let error = shm_region_stats(&pixels, &frame, false, region).unwrap_err();
+
+            assert!(
+                error.to_string().contains("outside the 2x2 frame"),
+                "unexpected error for {region:?}: {error}"
+            );
+        }
+        assert!(shm_region_stats(&pixels[1..], &frame, false, Rect::new(0, 0, 1, 1)).is_err());
+    }
+
     /// In-process stand-in for a wlroots compositor: advertises screencopy,
     /// `wl_shm` and named outputs, and answers each `copy` from a script.
     mod fake {
@@ -561,6 +627,34 @@
         let report = compositor.finish();
         assert_eq!((report.pools, report.buffers), (1, 1));
         assert_eq!((report.copies, report.frames_destroyed), (2, 2));
+    }
+
+    #[test]
+    fn samples_regions_of_the_last_captured_frame_only() {
+        let (compositor, connection) = FakeCompositor::spawn(padded_scenario(vec![
+            Reply::Ready { y_invert: true },
+            Reply::Failed,
+        ]));
+        let mut client = ScreencopyClient::from_connection(connection, "HDMI-A-1").unwrap();
+        let top_left = Rect::new(0, 0, 2, 1);
+
+        let before = client.region_stats(top_left).unwrap_err();
+        client.capture().unwrap();
+        // The frame is y-inverted, so its top-left pixels are the two whites.
+        let sampled = client.region_stats(top_left).unwrap();
+        client.capture().unwrap_err();
+        let after_failure = client.region_stats(top_left).unwrap_err();
+        settle(&mut client);
+
+        assert_eq!(sampled.mean_bgr, [255.0; 3]);
+        assert_eq!(sampled.luma_std, 0.0);
+        for error in [before, after_failure] {
+            assert!(
+                error.to_string().contains("no captured frame"),
+                "unexpected error: {error}"
+            );
+        }
+        compositor.finish();
     }
 
     #[test]

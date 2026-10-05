@@ -59,7 +59,10 @@ mod matcher {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    pub use engine::scan_all;
+    pub use engine::{
+        bgr_color_stats, mat_color_stats, scan_all, verify_colors, ColorComparison, ColorStats,
+        MAX_CONTRAST_RATIO, MAX_MEAN_CHANNEL_DELTA, MIN_CONTRAST_RATIO,
+    };
     pub use prepare::prepare_rules;
 
     #[derive(Debug, Clone)]
@@ -68,6 +71,7 @@ mod matcher {
         pub template_path: PathBuf,
         pub template_size: (u32, u32),
         pub template_mat: Arc<Mat>,
+        pub template_colors: ColorStats,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,7 +87,7 @@ mod matcher {
     #[cfg(test)]
     mod tests {
         use super::collect::collect_regions;
-        use super::engine::load_grayscale_mat;
+        use super::engine::{load_grayscale_mat, load_template};
         use super::prepare::prepare_rules_with_loader;
         use super::*;
         use image::{Rgba, RgbaImage};
@@ -139,9 +143,9 @@ mod runtime {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::matcher::{MatchRegion, PreparedRule};
+        use crate::matcher::{ColorStats, MatchRegion, PreparedRule};
         use anyhow::anyhow;
-        use opencv::core::{Mat, Scalar, CV_8UC1};
+        use opencv::core::{Mat, Rect, Scalar, CV_8UC1};
         use std::sync::{Arc, Mutex};
 
         include!("unit/runtime_tests.rs");

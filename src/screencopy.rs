@@ -1,3 +1,4 @@
+use crate::matcher::{bgr_color_stats, ColorStats};
 use anyhow::{anyhow, bail, Context, Result};
 use opencv::core::{self, Mat, Rect, Vec4b};
 use opencv::imgproc;
@@ -62,6 +63,15 @@ impl FrameLayout {
         }
     }
 
+    /// Byte offsets of blue, green and red within one pixel in memory.
+    fn bgr_offsets(&self) -> Option<[usize; 3]> {
+        match self.format {
+            Format::Xrgb8888 | Format::Argb8888 => Some([0, 1, 2]),
+            Format::Xbgr8888 | Format::Abgr8888 => Some([2, 1, 0]),
+            _ => None,
+        }
+    }
+
     /// Number of bytes the frame occupies in its shm buffer.
     pub fn byte_len(&self) -> usize {
         self.stride as usize * self.height as usize
@@ -91,6 +101,21 @@ impl FrameLayout {
         }
         Ok((conversion, width, height))
     }
+
+    /// Validates the layout and that `pixels` holds exactly one frame of it.
+    fn validate_pixels(&self, pixels: &[u8]) -> Result<(i32, i32, i32)> {
+        let validated = self.validate()?;
+        if pixels.len() != self.byte_len() {
+            bail!(
+                "frame holds {} bytes, expected {} bytes (stride {} x height {})",
+                pixels.len(),
+                self.byte_len(),
+                self.stride,
+                self.height
+            );
+        }
+        Ok(validated)
+    }
 }
 
 /// Converts a raw `wl_shm` frame into a single-channel 8-bit grayscale matrix,
@@ -99,16 +124,7 @@ impl FrameLayout {
 /// Row padding past `width` is skipped and a `y_invert` frame is flipped so row
 /// zero is always the top of the output.
 pub fn shm_frame_to_grayscale(pixels: &[u8], layout: &FrameLayout, y_invert: bool) -> Result<Mat> {
-    let (conversion, width, height) = layout.validate()?;
-    if pixels.len() != layout.byte_len() {
-        bail!(
-            "frame holds {} bytes, expected {} bytes (stride {} x height {})",
-            pixels.len(),
-            layout.byte_len(),
-            layout.stride,
-            layout.height
-        );
-    }
+    let (conversion, width, height) = layout.validate_pixels(pixels)?;
 
     // View the buffer with the padding as extra columns, then crop them away;
     // `cvt_color` reads the non-continuous ROI without copying it first.
@@ -128,6 +144,43 @@ pub fn shm_frame_to_grayscale(pixels: &[u8], layout: &FrameLayout, y_invert: boo
     let mut flipped = Mat::default();
     core::flip(&gray, &mut flipped, 0).context("failed to flip a y-inverted shm frame")?;
     Ok(flipped)
+}
+
+/// Mean color and luminance spread of `region` in a raw `wl_shm` frame.
+///
+/// `region` is in the top-down coordinates of [`shm_frame_to_grayscale`]'s
+/// output: a `y_invert` frame is read bottom row first. Only the region's own
+/// pixels are visited, straight from the buffer, honoring the format's channel
+/// order and skipping row padding.
+pub fn shm_region_stats(
+    pixels: &[u8],
+    layout: &FrameLayout,
+    y_invert: bool,
+    region: Rect,
+) -> Result<ColorStats> {
+    let (_, width, height) = layout.validate_pixels(pixels)?;
+    let offsets = layout
+        .bgr_offsets()
+        .with_context(|| format!("unsupported wl_shm format {:?}", layout.format))?;
+    let inside = |start: i32, length: i32, limit: i32| {
+        start >= 0 && length > 0 && i64::from(start) + i64::from(length) <= i64::from(limit)
+    };
+    if !inside(region.x, region.width, width) || !inside(region.y, region.height, height) {
+        bail!("region {region:?} lies outside the {width}x{height} frame or has no pixels");
+    }
+
+    let stride = layout.stride as usize;
+    let row_start = region.x as usize * BYTES_PER_PIXEL as usize;
+    let row_end = row_start + region.width as usize * BYTES_PER_PIXEL as usize;
+    let region_pixels = (region.y..region.y + region.height).flat_map(|y| {
+        let row = if y_invert { height - 1 - y } else { y } as usize * stride;
+        pixels[row + row_start..row + row_end]
+            .as_chunks::<{ BYTES_PER_PIXEL as usize }>()
+            .0
+            .iter()
+            .map(move |pixel| offsets.map(|offset| pixel[offset]))
+    });
+    bgr_color_stats(region_pixels).context("color statistics need at least one pixel")
 }
 
 enum FrameOutcome {
@@ -341,6 +394,9 @@ pub struct ScreencopyClient {
     connector: String,
     buffer: Option<ShmBuffer>,
     pixels: Vec<u8>,
+    /// Layout and `y_invert` of the frame held in `pixels`, while it is a
+    /// complete capture; cleared when a new capture starts.
+    captured: Option<(FrameLayout, bool)>,
     next_serial: u64,
     frame_timeout: Duration,
 }
@@ -398,6 +454,7 @@ impl ScreencopyClient {
             connector: connector.into(),
             buffer: None,
             pixels: Vec::new(),
+            captured: None,
             next_serial: 0,
             frame_timeout: FRAME_TIMEOUT,
         })
@@ -411,6 +468,7 @@ impl ScreencopyClient {
         if self.state.selected_output_removed {
             bail!("Wayland output {} was removed", self.connector);
         }
+        self.captured = None;
         let deadline = Instant::now() + self.frame_timeout;
         self.next_serial += 1;
         self.state.frame = FrameState::new(self.next_serial);
@@ -461,7 +519,22 @@ impl ScreencopyClient {
             .file
             .read_exact_at(&mut self.pixels, 0)
             .context("failed to read the screencopy shm buffer")?;
-        shm_frame_to_grayscale(&self.pixels, &layout, self.state.frame.y_invert)
+        let y_invert = self.state.frame.y_invert;
+        let gray = shm_frame_to_grayscale(&self.pixels, &layout, y_invert)?;
+        self.captured = Some((layout, y_invert));
+        Ok(gray)
+    }
+
+    /// Mean color and luminance spread of `region` in the last captured frame,
+    /// in the coordinates of the grayscale matrix [`Self::capture`] returned.
+    ///
+    /// Reads the region straight from the frame's pixels, which stay in memory
+    /// until the next capture, so no color copy of the frame is ever made.
+    pub fn region_stats(&self, region: Rect) -> Result<ColorStats> {
+        let (layout, y_invert) = self
+            .captured
+            .context("no captured frame to sample: the last capture failed or none ran yet")?;
+        shm_region_stats(&self.pixels, &layout, y_invert, region)
     }
 
     /// Returns the cached buffer when the layout is unchanged, else replaces it.

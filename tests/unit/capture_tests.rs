@@ -2,10 +2,12 @@ fn gray_mat(width: i32, height: i32) -> Mat {
     Mat::new_rows_cols_with_default(height, width, CV_8UC1, Scalar::all(0.0)).unwrap()
 }
 
-/// Hands out queued frames, recording how many were requested.
+/// Hands out queued frames, recording how many were requested, and samples
+/// regions of the last one handed out.
 struct QueuedFrames {
     frames: VecDeque<Result<Mat>>,
     requests: usize,
+    last: Option<Mat>,
 }
 
 impl QueuedFrames {
@@ -13,6 +15,7 @@ impl QueuedFrames {
         Self {
             frames: frames.into(),
             requests: 0,
+            last: None,
         }
     }
 }
@@ -20,9 +23,17 @@ impl QueuedFrames {
 impl FrameSource for QueuedFrames {
     fn capture_frame(&mut self) -> Result<Mat> {
         self.requests += 1;
-        self.frames
+        let frame = self
+            .frames
             .pop_front()
-            .unwrap_or_else(|| Err(anyhow!("no frame queued")))
+            .unwrap_or_else(|| Err(anyhow!("no frame queued")))?;
+        self.last = Some(frame.clone());
+        Ok(frame)
+    }
+
+    fn region_stats(&self, region: Rect) -> Result<ColorStats> {
+        let frame = self.last.as_ref().ok_or_else(|| anyhow!("no captured frame"))?;
+        crate::matcher::mat_color_stats(&frame.roi(region)?)
     }
 }
 
@@ -82,4 +93,21 @@ fn records_only_positive_decoded_capture_extents() {
         }
     );
     assert!(CapturedImage::from_decoded(Mat::default()).is_err());
+}
+
+#[test]
+fn samples_regions_of_the_last_capture_and_names_the_output_on_failure() {
+    let mut frame = gray_mat(6, 4);
+    *frame.at_2d_mut::<u8>(1, 2).unwrap() = 200;
+    let source = QueuedFrames::new(vec![Ok(frame)]);
+    let mut capture = CaptureService::with_source("HDMI-A-1", source);
+
+    let before = format!("{:#}", capture.region_stats(Rect::new(2, 1, 2, 1)).unwrap_err());
+    capture.capture_monitor().unwrap();
+    let stats = capture.region_stats(Rect::new(2, 1, 2, 1)).unwrap();
+
+    assert!(before.contains("HDMI-A-1"), "unexpected error: {before}");
+    assert!(before.contains("no captured frame"), "unexpected error: {before}");
+    assert_eq!(stats.mean_bgr, [100.0; 3]);
+    assert_eq!(stats.luma_std, 100.0);
 }

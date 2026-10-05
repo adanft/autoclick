@@ -1,5 +1,5 @@
-use super::engine::{load_grayscale_mat, mat_dimensions, template_stddev};
-use super::PreparedRule;
+use super::engine::{load_template, mat_dimensions, template_stddev};
+use super::{ColorStats, PreparedRule};
 use crate::config::RuleConfig;
 use anyhow::{bail, Context, Result};
 use opencv::core::Mat;
@@ -16,7 +16,7 @@ const MIN_TEMPLATE_STDDEV: f64 = 1e-3;
 
 /// Resolves template assets from disk and prepares them for runtime matching.
 pub fn prepare_rules(rules: &[RuleConfig], templates_dir: &Path) -> Result<Vec<PreparedRule>> {
-    prepare_rules_with_loader(rules, templates_dir, load_grayscale_mat)
+    prepare_rules_with_loader(rules, templates_dir, load_template)
 }
 
 pub(crate) fn prepare_rules_with_loader<F>(
@@ -25,9 +25,9 @@ pub(crate) fn prepare_rules_with_loader<F>(
     mut load: F,
 ) -> Result<Vec<PreparedRule>>
 where
-    F: FnMut(&Path) -> Result<Mat>,
+    F: FnMut(&Path) -> Result<(Mat, ColorStats)>,
 {
-    let mut cache = BTreeMap::<PathBuf, Arc<Mat>>::new();
+    let mut cache = BTreeMap::<PathBuf, (Arc<Mat>, ColorStats)>::new();
     let mut prepared = Vec::with_capacity(rules.len());
 
     for rule in rules {
@@ -40,18 +40,19 @@ where
             );
         }
 
-        let template_mat = match cache.get(&template_path) {
-            Some(mat) => Arc::clone(mat),
+        let (template_mat, template_colors) = match cache.get(&template_path) {
+            Some((mat, colors)) => (Arc::clone(mat), *colors),
             None => {
-                let mat = Arc::new(load(&template_path).with_context(|| {
+                let (mat, colors) = load(&template_path).with_context(|| {
                     format!(
                         "template asset `{}` could not be read from {}",
                         rule.target_template,
                         template_path.display()
                     )
-                })?);
-                cache.insert(template_path.clone(), Arc::clone(&mat));
-                mat
+                })?;
+                let mat = Arc::new(mat);
+                cache.insert(template_path.clone(), (Arc::clone(&mat), colors));
+                (mat, colors)
             }
         };
 
@@ -63,6 +64,7 @@ where
             template_path,
             template_size,
             template_mat,
+            template_colors,
         });
     }
 

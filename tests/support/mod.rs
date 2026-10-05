@@ -96,3 +96,99 @@ impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for ThreadSink {
 
 #[derive(Clone, Default)]
 struct LogBuffer(std::sync::Arc<Mutex<Vec<u8>>>);
+
+/// One pixel in OpenCV's blue, green, red channel order.
+pub type Bgr = [u8; 3];
+
+/// A 24x12 BGR button: a `fill` face carrying two `text` bars, one of them
+/// taller, so grayscale matching locates it in both axes.
+pub fn button(fill: Bgr, text: Bgr) -> opencv::core::Mat {
+    bgr_image(24, 12, |row, col| {
+        let short_bar = (4..8).contains(&row) && (3..9).contains(&col);
+        let tall_bar = (2..10).contains(&row) && (13..20).contains(&col);
+        if short_bar || tall_bar {
+            text
+        } else {
+            fill
+        }
+    })
+}
+
+/// A `width` x `height` BGR image whose pixel at (`row`, `col`) is `pixel(row, col)`.
+pub fn bgr_image(width: i32, height: i32, pixel: impl Fn(i32, i32) -> Bgr) -> opencv::core::Mat {
+    use opencv::core::{Mat, Scalar, Vec3b, CV_8UC3};
+    use opencv::prelude::*;
+
+    let mut image = Mat::new_rows_cols_with_default(height, width, CV_8UC3, Scalar::all(0.0))
+        .expect("failed to allocate a BGR test image");
+    for row in 0..height {
+        for col in 0..width {
+            *image.at_2d_mut::<Vec3b>(row, col).unwrap() = Vec3b::from(pixel(row, col));
+        }
+    }
+    image
+}
+
+/// Maps every pixel of a BGR image through `map`.
+pub fn map_pixels(image: &opencv::core::Mat, map: impl Fn(Bgr) -> Bgr) -> opencv::core::Mat {
+    use opencv::core::Vec3b;
+    use opencv::prelude::MatTraitConst;
+
+    bgr_image(image.cols(), image.rows(), |row, col| {
+        map(image.at_2d::<Vec3b>(row, col).unwrap().0)
+    })
+}
+
+/// A `background` BGR screen with `stamp` copied at (`left`, `top`).
+pub fn screen_with(
+    width: i32,
+    height: i32,
+    background: Bgr,
+    stamp: &opencv::core::Mat,
+    left: i32,
+    top: i32,
+) -> opencv::core::Mat {
+    use opencv::core::Vec3b;
+    use opencv::prelude::MatTraitConst;
+
+    bgr_image(width, height, |row, col| {
+        let inside =
+            (left..left + stamp.cols()).contains(&col) && (top..top + stamp.rows()).contains(&row);
+        if inside {
+            stamp.at_2d::<Vec3b>(row - top, col - left).unwrap().0
+        } else {
+            background
+        }
+    })
+}
+
+/// The grayscale matrix the matcher would see for a BGR image.
+pub fn to_gray(image: &opencv::core::Mat) -> opencv::core::Mat {
+    let mut gray = opencv::core::Mat::default();
+    opencv::imgproc::cvt_color_def(image, &mut gray, opencv::imgproc::COLOR_BGR2GRAY)
+        .expect("failed to convert a BGR test image to grayscale");
+    gray
+}
+
+/// The face and text colors of the synthetic button the color-check tests target.
+pub const BUTTON_FILL: Bgr = [60, 170, 40];
+pub const BUTTON_TEXT: Bgr = [255, 255, 255];
+/// The dark blue screen background around the synthetic button.
+pub const SCREEN_BACKGROUND: Bgr = [90, 40, 30];
+/// A red face with the same BT.601 luma as [`BUTTON_FILL`] (both 119 in gray).
+pub const SAME_LUMA_RED_FILL: Bgr = [80, 70, 230];
+
+/// Blends every channel `fraction` of the way from `pixel` toward `target`.
+pub fn blend_toward(pixel: Bgr, target: u8, fraction: f64) -> Bgr {
+    pixel.map(|channel| {
+        let channel = f64::from(channel);
+        (channel + (f64::from(target) - channel) * fraction).round() as u8
+    })
+}
+
+/// Replaces every channel with the pixel's BT.601 luma, keeping its brightness.
+pub fn desaturate(pixel: Bgr) -> Bgr {
+    let [blue, green, red] = pixel.map(f64::from);
+    let luma = (0.114 * blue + 0.587 * green + 0.299 * red).round() as u8;
+    [luma; 3]
+}

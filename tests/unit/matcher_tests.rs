@@ -96,7 +96,7 @@ fn reuses_prepared_template_assets_for_duplicate_rules() {
         &templates_dir,
         move |path| {
             *load_calls_for_loader.lock().unwrap() += 1;
-            load_grayscale_mat(path)
+            load_template(path)
         },
     )
     .unwrap();
@@ -378,4 +378,219 @@ fn accepts_a_template_with_any_real_contrast() {
     .unwrap();
 
     assert_eq!(prepared[0].template_size, (4, 4));
+}
+
+#[test]
+fn records_the_template_color_statistics_at_startup() {
+    let dir = tempdir().unwrap();
+    let templates_dir = dir.path().join("templates");
+    std::fs::create_dir_all(&templates_dir).unwrap();
+    // Five red pixels and one blue one; OpenCV's luma is 76 for red, 29 for blue.
+    write_png(&templates_dir.join("accept_button.png"), &contrasting_template(3, 2));
+
+    let prepared = prepare_rules(
+        &[crate::config::RuleConfig {
+            target_template: "accept_button.png".to_string(),
+        }],
+        &templates_dir,
+    )
+    .unwrap();
+
+    let colors = prepared[0].template_colors;
+    assert_eq!(colors.mean_bgr, [255.0 / 6.0, 0.0, 255.0 * 5.0 / 6.0]);
+    assert!(
+        (colors.luma_std - 11045_f64.sqrt() / 6.0).abs() < 1e-9,
+        "unexpected luma deviation {}",
+        colors.luma_std
+    );
+}
+
+#[test]
+fn derives_color_statistics_from_bgr_pixels_with_opencv_luma() {
+    // Red and blue luma 76 and 29, exactly as OpenCV's BGR2GRAY rounds them.
+    let stats = bgr_color_stats([[0, 0, 255], [255, 0, 0]]).unwrap();
+
+    assert_eq!(stats.mean_bgr, [127.5, 0.0, 127.5]);
+    assert_eq!(stats.luma_std, 23.5);
+    assert!(bgr_color_stats(std::iter::empty()).is_none());
+}
+
+#[test]
+fn reads_gray_and_bgr_matrices_and_their_regions_alike() {
+    use crate::support::{bgr_image, to_gray};
+    use opencv::core::Rect;
+    use opencv::prelude::MatTraitConst;
+
+    let image = bgr_image(4, 3, |row, col| [(row * 4 + col) as u8 * 10, 0, 0]);
+    let gray_image = bgr_image(4, 3, |row, col| [(row * 4 + col) as u8 * 10; 3]);
+    let region = Rect::new(1, 1, 2, 2);
+
+    let bgr = mat_color_stats(&image.roi(region).unwrap()).unwrap();
+    let gray = mat_color_stats(&to_gray(&gray_image).roi(region).unwrap()).unwrap();
+
+    // Pixels 5, 6, 9 and 10 (times ten) in the blue channel only.
+    assert_eq!(bgr.mean_bgr, [75.0, 0.0, 0.0]);
+    assert_eq!(gray.mean_bgr, [75.0; 3]);
+    assert!(gray.luma_std > 0.0);
+}
+
+/// A prepared rule for a BGR `template`, as `prepare_rules` would build it.
+fn color_rule(template: &Mat) -> PreparedRule {
+    use opencv::prelude::MatTraitConst;
+
+    PreparedRule {
+        target_template: "button.png".to_string(),
+        template_path: PathBuf::from("button.png"),
+        template_size: (template.cols() as u32, template.rows() as u32),
+        template_mat: Arc::new(crate::support::to_gray(template)),
+        template_colors: mat_color_stats(template).unwrap(),
+    }
+}
+
+/// Stamps `variant` on a colored screen and matches the exact synthetic button
+/// against it, returning the region grayscale matching found and the region left
+/// after the color check.
+fn match_variant(variant: &Mat) -> (Vec<MatchRegion>, Vec<MatchRegion>) {
+    use crate::support::{button, screen_with, to_gray, BUTTON_FILL, BUTTON_TEXT};
+    use crate::support::SCREEN_BACKGROUND;
+    use opencv::prelude::MatTraitConst;
+
+    let rule = color_rule(&button(BUTTON_FILL, BUTTON_TEXT));
+    let screen = screen_with(80, 40, SCREEN_BACKGROUND, variant, 30, 14);
+    let rules = [rule];
+    let mut matches = scan_all(&to_gray(&screen), &rules, 0.9).unwrap();
+    let in_gray = matches["button.png"].clone();
+    verify_colors(&mut matches, &rules, |region| {
+        mat_color_stats(&screen.roi(region)?)
+    })
+    .unwrap();
+    (in_gray, matches["button.png"].clone())
+}
+
+fn button_at_stamp() -> Vec<MatchRegion> {
+    vec![MatchRegion { left: 30, top: 14, width: 24, height: 12 }]
+}
+
+#[test]
+fn the_color_check_accepts_the_exact_button_and_its_hover_highlight() {
+    use crate::support::{blend_toward, button, map_pixels, BUTTON_FILL, BUTTON_TEXT};
+
+    let exact = button(BUTTON_FILL, BUTTON_TEXT);
+    // The virtual pointer rests on the button after a click, lightening it.
+    let hovered = map_pixels(&exact, |pixel| blend_toward(pixel, 255, 0.12));
+
+    for variant in [&exact, &hovered] {
+        assert_eq!(match_variant(variant), (button_at_stamp(), button_at_stamp()));
+    }
+}
+
+#[test]
+fn the_color_check_rejects_dimmed_desaturated_and_recolored_copies() {
+    use crate::support::{blend_toward, button, desaturate, map_pixels, BUTTON_FILL};
+    use crate::support::{BUTTON_TEXT, SAME_LUMA_RED_FILL};
+
+    let exact = button(BUTTON_FILL, BUTTON_TEXT);
+    let dimmed = map_pixels(&exact, |pixel| blend_toward(pixel, 128, 0.4));
+    let gray_on_gray = map_pixels(&exact, desaturate);
+    let recolored = button(SAME_LUMA_RED_FILL, BUTTON_TEXT);
+
+    for (name, variant) in [
+        ("dimmed", &dimmed),
+        ("gray-on-gray", &gray_on_gray),
+        ("recolored", &recolored),
+    ] {
+        // Grayscale matching alone cannot tell these from the real button.
+        assert_eq!(
+            match_variant(variant),
+            (button_at_stamp(), Vec::new()),
+            "{name} copy"
+        );
+    }
+}
+
+#[test]
+fn an_inverted_button_ends_unmatched() {
+    use crate::support::{button, map_pixels, BUTTON_FILL, BUTTON_TEXT};
+
+    let inverted = map_pixels(&button(BUTTON_FILL, BUTTON_TEXT), |pixel| {
+        pixel.map(|channel| 255 - channel)
+    });
+
+    assert_eq!(match_variant(&inverted).1, Vec::new());
+}
+
+#[test]
+fn compares_mean_color_and_contrast_against_the_tolerances() {
+    let template = ColorStats { mean_bgr: [100.0, 100.0, 100.0], luma_std: 40.0 };
+    let region = |delta: f64, luma_std: f64| ColorStats {
+        mean_bgr: [100.0, 100.0 - delta, 100.0],
+        luma_std,
+    };
+
+    let comparison = ColorComparison::between(&template, &region(12.5, 30.0));
+    assert_eq!(comparison.channel_deltas, [0.0, -12.5, 0.0]);
+    assert_eq!(comparison.max_channel_delta(), 12.5);
+    assert_eq!(comparison.contrast_ratio, 0.75);
+    assert!(comparison.accepted());
+
+    let at_limits = [
+        (MAX_MEAN_CHANNEL_DELTA, 40.0 * MIN_CONTRAST_RATIO, true),
+        (0.0, 40.0 * MAX_CONTRAST_RATIO, true),
+        (MAX_MEAN_CHANNEL_DELTA + 0.5, 40.0, false),
+        (0.0, 40.0 * MIN_CONTRAST_RATIO - 0.5, false),
+        (0.0, 40.0 * MAX_CONTRAST_RATIO + 0.5, false),
+    ];
+    for (delta, luma_std, accepted) in at_limits {
+        assert_eq!(
+            ColorComparison::between(&template, &region(delta, luma_std)).accepted(),
+            accepted,
+            "delta {delta}, luma deviation {luma_std}"
+        );
+    }
+}
+
+#[test]
+fn a_flat_template_only_accepts_an_equally_flat_region() {
+    let flat = ColorStats { mean_bgr: [50.0; 3], luma_std: 0.0 };
+
+    assert!(ColorComparison::between(&flat, &flat).accepted());
+    assert!(!ColorComparison::between(&flat, &ColorStats { luma_std: 3.0, ..flat }).accepted());
+}
+
+#[test]
+fn a_rejected_match_is_logged_and_its_sample_failure_is_an_error() {
+    let template = ColorStats { mean_bgr: [60.0, 170.0, 40.0], luma_std: 50.0 };
+    let rule = PreparedRule {
+        target_template: "button.png".to_string(),
+        template_path: PathBuf::from("button.png"),
+        template_size: (24, 12),
+        template_mat: Arc::new(Mat::default()),
+        template_colors: template,
+    };
+    let found = || {
+        MatchSet::from([(
+            "button.png".to_string(),
+            vec![MatchRegion { left: 3, top: 4, width: 24, height: 12 }],
+        )])
+    };
+    let red = ColorStats { mean_bgr: [80.0, 70.0, 230.0], luma_std: 50.0 };
+
+    let mut matches = found();
+    let logs = crate::support::capture_debug_logs(|| {
+        verify_colors(&mut matches, std::slice::from_ref(&rule), |region| {
+            assert_eq!(region, opencv::core::Rect::new(3, 4, 24, 12));
+            Ok(red)
+        })
+        .unwrap();
+    });
+    assert_eq!(matches["button.png"], Vec::new());
+    assert!(logs.contains("color check rejected match"), "logs: {logs}");
+    assert!(logs.contains("target_template=button.png"), "logs: {logs}");
+    assert!(logs.contains("max_channel_delta=190"), "logs: {logs}");
+    assert!(logs.contains("contrast_ratio=1"), "logs: {logs}");
+
+    let mut matches = found();
+    let error = verify_colors(&mut matches, &[rule], |_| Err(anyhow::anyhow!("no frame")))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("button.png"), "unexpected error: {error:#}");
 }
