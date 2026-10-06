@@ -56,6 +56,18 @@ That was the original use case, but the same idea can also work for other simila
 
 This repository does not currently document distro-specific install commands because the required package names vary.
 
+## Install
+
+`install.sh` builds the release binary as your user and copies it with root rights to `/usr/local/bin/autoclick`:
+
+```bash
+./install.sh              # asks for your sudo password only for the copy
+sudo ./install.sh         # also works: the build still runs as you, not as root
+./install.sh --uninstall
+```
+
+Set `BIN_DIR` to install somewhere else, for example `BIN_DIR=/usr/bin ./install.sh`. The build never runs as root, so `target/` stays owned by you. Running it from a root login, without `sudo`, is refused. It warns when another `autoclick` comes earlier in `PATH`, and when `hyprctl` is missing.
+
 ## First Use
 
 Before the first run, prepare the config directory and put your PNG templates there.
