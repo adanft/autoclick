@@ -98,8 +98,9 @@ Important:
 cargo run
 ```
 
-Logs go to `stderr`. By default only warnings and errors are shown, so every
-skipped monitor cycle is reported with its stage and cause.
+Logs go to `stderr`, each line starting with its UTC timestamp. By default only
+warnings and errors are shown, so every skipped monitor cycle is reported with
+its stage and cause.
 
 ```bash
 RUST_LOG=info cargo run
@@ -108,7 +109,8 @@ RUST_LOG=debug cargo run
 
 The process keeps running until you press `q` and then `Enter`, or send `SIGINT` / `SIGTERM`
 (for example with Ctrl+C). The first signal asks the monitor loop to stop after the
-current cycle. A second signal exits immediately with status 130, without waiting
+current cycle, which every Wayland wait bounds (see the deadlines under Current
+behavior). A second signal exits immediately with status 130, without waiting
 for the cycle to finish.
 
 ## Config Shape
@@ -136,14 +138,21 @@ Current behavior:
 - each `target_template` may appear in only one rule (compared after trimming surrounding whitespace); loading or saving a config that repeats one fails with an error naming the duplicate and both rule indexes, a saved config with a repeat is treated as incompatible and triggers reconfiguration, and the interactive setup refuses a template already entered and asks again
 - best match per template
 - every best match is checked in color before it can be clicked: grayscale matching alone ignores brightness, contrast and hue, so a dimmed, disabled, gray or recolored copy of a button scores like the real one. The matched screen region's mean blue, green and red must each stay within 40 (out of 255) of the template's, and its luminance contrast within 0.75–1.33 times the template's; otherwise that template counts as unmatched for the cycle, with no fallback to a weaker candidate. A hover highlight (the button about 10–15% lighter while the virtual pointer rests on it after a click) still passes. Template colors are measured once at startup, and each cycle samples only the matched regions straight from the captured frame; `RUST_LOG=debug` logs the measured differences of every rejected match
+- a template that stays unclickable for 12 consecutive cycles (one minute at a 5-second interval), because it keeps matching in grayscale but failing the color check or is larger than the captured frame and cannot be scored, is reported with a warning, `template <name> keeps matching in grayscale but failing the color check` (with its score, largest channel difference and contrast ratio) or `template <name> is larger than the captured frame and cannot be matched` (with both sizes). The warning repeats at most once a minute while the streak lasts, and the streak ends as soon as the template is accepted or simply not found
 - at most one click per cycle: every template is still scanned, but only one matched rule is clicked, and the other matched rules wait for the next cycle's fresh capture, so no click aims at a screen the previous click already changed
 - matched rules take turns: the next cycle searches the rules after the one it just clicked, wrapping around, so that rule goes last; when it is the only match it is clicked again, and a target that stays on screen after its click cannot keep the other rules from being clicked. A cycle that clicks nothing or fails, and the first cycle after startup, follow config order
 - one persistent wlr-screencopy connection captures the configured output, without the cursor, into a reused shared-memory buffer; each frame is converted straight to grayscale and handed to the matcher, with no external process, image encoding, or disk I/O
 - templates of a single uniform color are rejected during startup: normalized matching scores every position of every screenshot at 1.0 against them, so the runtime would click the top-left corner forever
 - runtime failures are surfaced by stage (`capture`, `OpenCV match`, `click execution`)
-- a failed capture or match skips that cycle with a warning; after 5 consecutive skipped cycles the loop stops with an error naming the last stage and its cause, and any successful cycle resets the count
-- a click failure stops the loop immediately
-- a screencopy frame the compositor does not finish within 2 seconds fails that capture, so a stalled compositor cannot block the loop
+- a failed capture or match skips that cycle with a warning, and any successful cycle resets the count of consecutive failures
+- the loop never exits over screen or compositor trouble. It enters a waiting state instead, at once on a disconnect or a stall, or after 5 consecutive failed cycles of any other kind, such as frames that time out while the output is powered off, an unsupported frame format, a Wayland protocol error, or a failed match:
+  - a disconnect is the configured output being unplugged (its `wl_output` global is removed) or a Wayland connection failing on I/O, such as the compositor closing the socket; the next capture fails at once, with no 2-second wait and no frame from the removed output, and the virtual pointer reports the same when a click finds its output gone. A stall is a click whose compositor round trip is not answered within its deadline. A protocol error is not a disconnect: it counts as an ordinary failure
+  - entering the state logs one warning: `output <connector> disconnected; waiting for it to return`, `output <connector> stopped answering; waiting for it to return`, or `output <connector> failed 5 consecutive cycles; waiting for it to recover`, each with its cause
+  - every attempt drops both the screencopy client and the virtual pointer, connects both again by connector name, and runs one cycle on them. The first attempt comes after 1 second, and each failed attempt, whether connecting or that cycle failed, doubles the wait up to 10 seconds; a reconnect alone does not reset it, so a failure that repeats on every attempt is retried no more than once every 10 seconds
+  - only a successful cycle ends the state. It logs `monitoring of output <connector> resumed` as a warning, so the default log level shows when the outage ended, resets the wait to 1 second and the failure count, and normal cycles resume with the rule turns starting again in config order
+  - while waiting, `output <connector> is still unavailable; waiting for it to return` is repeated about every 60 seconds with the time waited and the last error; each failed attempt is logged at `RUST_LOG=debug`. `q`, SIGINT and SIGTERM stop the process while it waits; if a reconnect attempt is in progress against a compositor that does not answer, the first signal takes effect when that attempt times out (up to about 10 seconds: a 5-second deadline for each of the two connections), and a second signal exits immediately
+- a click failure stops the loop immediately with an error, unless it is a disconnect or a stall: an unsupported output transform, or a lost seat or virtual-pointer manager, is configuration drift that no wait repairs
+- every Wayland wait has a deadline, so a compositor that stops answering cannot hang the process: a screencopy frame not finished within 2 seconds fails that capture; each round trip of a click (the check on the way in and the barrier on the way out) fails within 2 seconds as a stall; connecting either client fails within 5 seconds, which during the waiting state counts as a failed attempt
 - one persistent, output-bound Wayland virtual pointer sends absolute motion, left-button press, and left-button release directly from the process
 - each click is a synchronous framed transaction on one Wayland connection: it validates once on the way in, queues motion, press and release, and flushes them in a single write closed by one protocol round trip, so press and release reach the compositor together
 - invalidation or delivery failures stop the transaction instead of falling back to another input path
@@ -177,7 +186,7 @@ The runtime uses three session-facing APIs:
 
 Both Wayland clients need a wlroots-family compositor such as Hyprland or Sway; GNOME and KDE do not offer these protocols. The screencopy connection is opened once during startup, after the configured monitor is resolved, and startup fails with the connector named if the compositor does not offer screencopy for it.
 
-The virtual pointer is created once during startup and remains bound to the selected Wayland output for the process lifetime. If the selected manager, seat, or output becomes invalid, the backend reports an error rather than rebinding or retrying a click.
+The virtual pointer is created during startup and stays bound to the selected Wayland output. If the selected manager, seat, or output becomes invalid, the backend reports an error rather than rebinding or retrying a click. A removed output, a lost or stalled Wayland connection, and repeated capture or match failures are the exceptions the runtime recovers from: it waits, replacing both Wayland clients with new ones, until a cycle on them succeeds (see Current behavior). A missing output at startup is still a startup error.
 
 ## Development
 

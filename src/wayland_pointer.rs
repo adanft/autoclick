@@ -4,6 +4,7 @@ use anyhow::{anyhow, bail, Result};
 /// selected output-bound virtual pointer.
 mod protocol_substrate {
     use anyhow::Context;
+    use std::time::{Duration, Instant};
     use wayland_client::{
         protocol::{wl_output::WlOutput, wl_registry, wl_registry::WlRegistry, wl_seat::WlSeat},
         Connection, Dispatch, EventQueue, Proxy, QueueHandle,
@@ -105,6 +106,11 @@ mod protocol_substrate {
             self.discovery.reduce(super::DiscoveryEvent::OutputDone(id));
         }
 
+        pub(super) fn output_removed(&mut self, id: u32) {
+            self.discovery
+                .reduce(super::DiscoveryEvent::OutputRemoved(id));
+        }
+
         /// The discovery state machine invalidates a selected output whose
         /// metadata is withdrawn, but the `wl_output` dispatch below has no event
         /// that reaches this yet, so only the lifecycle tests drive it.
@@ -118,6 +124,44 @@ mod protocol_substrate {
             self.lifecycle.ensure_active()?;
             self.discovery.validate()
         }
+
+        /// Validates like [`Self::validate`], failing with a [`Disconnect`]
+        /// behind the reason when the selected output was removed.
+        ///
+        /// [`Disconnect`]: crate::capture::Disconnect
+        fn ensure_valid(&mut self) -> anyhow::Result<()> {
+            self.validate().map_err(|reason| {
+                if !self.discovery.selected_output_removed {
+                    return anyhow::Error::msg(reason);
+                }
+                let removed = crate::capture::Disconnect::OutputRemoved {
+                    connector: self.discovery.connector.clone(),
+                };
+                anyhow::Error::new(removed).context(reason)
+            })
+        }
+    }
+
+    /// Round-trips once within `timeout`, so one transaction step cannot hang
+    /// on a compositor that stopped answering. A missed deadline keeps the
+    /// [`Disconnect::Unresponsive`] behind the step's context, which the
+    /// runtime waits out like a disconnect instead of stopping on it.
+    ///
+    /// [`Disconnect::Unresponsive`]: crate::capture::Disconnect::Unresponsive
+    fn bounded_roundtrip(
+        connection: &Connection,
+        event_queue: &mut EventQueue<AdapterState>,
+        state: &mut AdapterState,
+        timeout: Duration,
+        step: &str,
+    ) -> anyhow::Result<()> {
+        crate::screencopy::sync_roundtrip(connection, event_queue, state, Instant::now() + timeout)
+            .with_context(|| {
+                format!(
+                    "virtual-pointer {step} roundtrip failed within its {} ms deadline",
+                    timeout.as_millis()
+                )
+            })
     }
 
     /// Runs queued adapter dispatch before a semantic request and denies stale pointers.
@@ -132,7 +176,7 @@ mod protocol_substrate {
         R: FnOnce() -> anyhow::Result<()>,
     {
         dispatch(state)?;
-        state.validate().map_err(anyhow::Error::msg)?;
+        state.ensure_valid()?;
         request()
     }
 
@@ -227,9 +271,7 @@ mod protocol_substrate {
                     state.seats.remove(&name);
                     state.outputs.remove(&name);
                     state.seat_removed(name);
-                    state
-                        .discovery
-                        .reduce(super::DiscoveryEvent::OutputRemoved(name));
+                    state.output_removed(name);
                 }
                 _ => {}
             }
@@ -282,6 +324,8 @@ mod protocol_substrate {
         event_queue: EventQueue<AdapterState>,
         state: AdapterState,
         pointer: Option<ZwlrVirtualPointerV1>,
+        /// Deadline of each round trip in a click transaction.
+        pub(super) step_timeout: Duration,
     }
 
     impl ProtocolSubstrate {
@@ -295,6 +339,16 @@ mod protocol_substrate {
             connection: Connection,
             connector: &str,
         ) -> anyhow::Result<Self> {
+            Self::from_connection_within(connection, connector, crate::screencopy::CONNECT_TIMEOUT)
+        }
+
+        /// [`Self::from_connection`] with discovery bounded by `timeout`.
+        pub(super) fn from_connection_within(
+            connection: Connection,
+            connector: &str,
+            timeout: Duration,
+        ) -> anyhow::Result<Self> {
+            let deadline = Instant::now() + timeout;
             let event_queue = connection.new_event_queue();
             // The registry proxy is not retained: `wl_registry` has no destroy
             // request and wayland-client implements no `Drop` for proxies, so the
@@ -305,17 +359,26 @@ mod protocol_substrate {
                 event_queue,
                 state: AdapterState::new(connector),
                 pointer: None,
+                step_timeout: super::CLICK_STEP_TIMEOUT,
             };
-            substrate
-                .event_queue
-                .roundtrip(&mut substrate.state)
-                .context("Wayland registry discovery roundtrip failed")?;
+            let failed = |what: &str| {
+                format!(
+                    "Wayland {what} discovery roundtrip failed within the {} ms connect deadline",
+                    timeout.as_millis()
+                )
+            };
+            let Self {
+                connection,
+                event_queue,
+                state,
+                ..
+            } = &mut substrate;
+            crate::screencopy::sync_roundtrip(connection, event_queue, state, deadline)
+                .with_context(|| failed("registry"))?;
             // Registry globals bind proxies during the first roundtrip; a second boundary
             // receives their wl_output metadata before selected-output validation.
-            substrate
-                .event_queue
-                .roundtrip(&mut substrate.state)
-                .context("Wayland output metadata discovery roundtrip failed")?;
+            crate::screencopy::sync_roundtrip(connection, event_queue, state, deadline)
+                .with_context(|| failed("output metadata"))?;
             substrate
                 .state
                 .validate()
@@ -334,12 +397,15 @@ mod protocol_substrate {
         /// once, before a transaction starts queueing requests.
         ///
         /// This is the only roundtrip a transaction pays on the way in; the
-        /// requests after it are queued and leave together at `barrier`.
+        /// requests after it are queued and leave together at `barrier`. It
+        /// fails within `step_timeout` when the compositor does not answer.
         pub(super) fn begin(&mut self) -> anyhow::Result<()> {
-            let (event_queue, state) = (&mut self.event_queue, &mut self.state);
+            let (connection, event_queue, state) =
+                (&self.connection, &mut self.event_queue, &mut self.state);
+            let timeout = self.step_timeout;
             semantic_request(
                 state,
-                |state| event_queue.roundtrip(state).map(|_| ()).map_err(Into::into),
+                |state| bounded_roundtrip(connection, event_queue, state, timeout, "begin"),
                 || Ok(()),
             )
         }
@@ -353,7 +419,7 @@ mod protocol_substrate {
         /// selected seat, output or manager is already known gone — recovery must
         /// refuse to write there rather than queue more requests.
         fn queued_pointer(&mut self) -> anyhow::Result<&ZwlrVirtualPointerV1> {
-            self.state.validate().map_err(anyhow::Error::msg)?;
+            self.state.ensure_valid()?;
             self.pointer
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("selected virtual pointer is closed"))
@@ -393,14 +459,22 @@ mod protocol_substrate {
         }
 
         /// Flushes the whole queued transaction in one write, then dispatches to
-        /// confirm the compositor did not invalidate the pointer meanwhile.
+        /// confirm the compositor did not invalidate the pointer meanwhile. The
+        /// confirmation fails within `step_timeout` when it never comes.
         pub(super) fn barrier(&mut self) -> anyhow::Result<()> {
             self.queued_pointer()?;
-            self.connection.flush()?;
-            let (event_queue, state) = (&mut self.event_queue, &mut self.state);
+            self.connection.flush().map_err(|error| {
+                crate::screencopy::wayland_failure(
+                    error,
+                    "failed to flush the virtual-pointer transaction",
+                )
+            })?;
+            let (connection, event_queue, state) =
+                (&self.connection, &mut self.event_queue, &mut self.state);
+            let timeout = self.step_timeout;
             semantic_barrier(
                 state,
-                |state| event_queue.roundtrip(state).map(|_| ()).map_err(Into::into),
+                |state| bounded_roundtrip(connection, event_queue, state, timeout, "barrier"),
                 || Ok(()),
             )
         }
@@ -469,6 +543,16 @@ mod protocol_substrate {
 /// Lowest `zwlr_virtual_pointer_manager_v1` version carrying the output-bound
 /// constructor this backend needs.
 const REQUIRED_MANAGER_VERSION: u32 = 2;
+
+/// Longest one round trip of a click transaction (`begin` or `barrier`) waits
+/// for the compositor.
+///
+/// A healthy compositor answers within a frame or two. One that stops
+/// answering would otherwise hang the click, and with it the monitor loop and
+/// shutdown, forever; two seconds matches the screencopy frame deadline, so a
+/// stalled click reaches the runtime, which waits it out, as fast as a stalled
+/// capture does.
+const CLICK_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Dimensions of the image from which an output-local click was planned.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -544,9 +628,10 @@ where
 
     fn execute(&mut self, click: &PlannedClick) -> Result<()> {
         let (x, y, width, height) = validate_click(click)?;
+        // Wrapped, not reworded: the runtime looks for a disconnect in the chain.
         self.port
             .begin()
-            .map_err(|error| anyhow!("virtual-pointer transaction rejected: {error}"))?;
+            .map_err(|error| error.context("virtual-pointer transaction rejected"))?;
         let motion_time = self.next_timestamp()?;
         self.port
             .motion_absolute(motion_time, x, y, width, height)
@@ -596,14 +681,15 @@ where
     }
 
     fn fail_after_press(&mut self, primary: anyhow::Error) -> anyhow::Error {
+        const FAILED: &str =
+            "virtual-pointer transaction failed after press; button delivery is unknown";
         let cleanup_time = self.clock.next_ms();
+        // Wrapped, not reworded: the runtime looks for a disconnect in the chain.
         match self.port.best_effort_release(cleanup_time) {
-            Ok(()) => anyhow!(
-                "virtual-pointer transaction failed after press; button delivery is unknown: {primary}"
-            ),
-            Err(cleanup) => anyhow!(
-                "virtual-pointer transaction failed after press; button delivery is unknown: {primary}; best-effort release failed: {cleanup}"
-            ),
+            Ok(()) => primary.context(FAILED),
+            Err(cleanup) => {
+                primary.context(format!("{FAILED}; best-effort release failed: {cleanup}"))
+            }
         }
     }
 }
@@ -691,6 +777,8 @@ struct DiscoveryState {
     selected_output: Option<u32>,
     manager_selected: bool,
     invalidated: bool,
+    /// Whether the invalidation includes the selected output's removal.
+    selected_output_removed: bool,
 }
 
 impl DiscoveryState {
@@ -704,6 +792,7 @@ impl DiscoveryState {
             selected_output: None,
             manager_selected: false,
             invalidated: false,
+            selected_output_removed: false,
         }
     }
 
@@ -729,6 +818,7 @@ impl DiscoveryState {
                 self.outputs.remove(&id);
                 if self.selected_output == Some(id) {
                     self.invalidated = true;
+                    self.selected_output_removed = true;
                 }
             }
             DiscoveryEvent::OutputMetadataLost(id) => {
@@ -832,11 +922,12 @@ impl WaylandPointerBackend {
 }
 
 impl Drop for WaylandPointerBackend {
-    /// Releases the virtual pointer on shutdown. `close` is idempotent, so an
-    /// explicit call before drop stays valid.
+    /// Releases the virtual pointer, at shutdown or when the runtime replaces
+    /// a disconnected backend. `close` is idempotent, so an explicit call
+    /// before drop stays valid.
     fn drop(&mut self) {
         if let Err(error) = self.close() {
-            tracing::warn!(error = %error, "Wayland virtual-pointer cleanup failed during shutdown");
+            tracing::warn!(error = %error, "Wayland virtual-pointer cleanup failed while closing");
         }
     }
 }

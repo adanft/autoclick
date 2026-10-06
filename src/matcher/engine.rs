@@ -3,7 +3,7 @@ use super::{MatchSet, PreparedRule};
 use anyhow::{bail, Context, Result};
 use opencv::core::{Mat, Rect, Vec3b, CV_8UC1, CV_8UC3};
 use opencv::{imgcodecs, imgproc, prelude::*};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tracing::debug;
 
@@ -30,6 +30,13 @@ pub const MIN_CONTRAST_RATIO: f64 = 0.75;
 /// the reciprocal of [`MIN_CONTRAST_RATIO`], so a template captured from a
 /// dimmed button rejects the bright one just as the opposite case does.
 pub const MAX_CONTRAST_RATIO: f64 = 1.0 / MIN_CONTRAST_RATIO;
+
+/// Best `TM_CCOEFF_NORMED` score of each template in one scan, or `None` for a
+/// template that could not be scored because it is larger than the screenshot.
+pub type TemplateScores = BTreeMap<String, Option<f64>>;
+
+/// How each best match the color check rejected differs from its template.
+pub type ColorRejections = BTreeMap<String, ColorComparison>;
 
 /// Mean color and luminance spread of an image area.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -158,11 +165,17 @@ pub fn mat_color_stats(image: &impl MatTraitConst) -> Result<ColorStats> {
 /// so a dimmed, disabled or recolored copy of a button scores like the real one.
 /// `sample` returns the color statistics of a screen rectangle; it is called
 /// once per matched template, on its best region only. A rejected template is
-/// left unmatched for this cycle rather than falling back to a weaker candidate.
-pub fn verify_colors<F>(matches: &mut MatchSet, rules: &[PreparedRule], mut sample: F) -> Result<()>
+/// left unmatched for this cycle rather than falling back to a weaker candidate,
+/// and returned with how its colors differed.
+pub fn verify_colors<F>(
+    matches: &mut MatchSet,
+    rules: &[PreparedRule],
+    mut sample: F,
+) -> Result<ColorRejections>
 where
     F: FnMut(Rect) -> Result<ColorStats>,
 {
+    let mut rejections = ColorRejections::new();
     let mut checked = BTreeSet::new();
     for rule in rules {
         if !checked.insert(rule.target_template.as_str()) {
@@ -205,8 +218,9 @@ where
             "color check rejected match"
         );
         regions.clear();
+        rejections.insert(rule.target_template.clone(), comparison);
     }
-    Ok(())
+    Ok(rejections)
 }
 
 /// Runs OpenCV template matching for every configured rule against one screenshot.
@@ -214,7 +228,18 @@ where
 /// The returned regions contain only the single best candidate that meets the
 /// threshold for each template.
 pub fn scan_all(screenshot_mat: &Mat, rules: &[PreparedRule], threshold: f32) -> Result<MatchSet> {
+    scan_all_scored(screenshot_mat, rules, threshold).map(|(matches, _)| matches)
+}
+
+/// [`scan_all`], also returning each template's best score, so a caller can
+/// tell a template that is not on screen from one it could not score.
+pub fn scan_all_scored(
+    screenshot_mat: &Mat,
+    rules: &[PreparedRule],
+    threshold: f32,
+) -> Result<(MatchSet, TemplateScores)> {
     let mut matches = MatchSet::new();
+    let mut scores = TemplateScores::new();
 
     for rule in rules {
         if matches.contains_key(&rule.target_template) {
@@ -253,10 +278,11 @@ pub fn scan_all(screenshot_mat: &Mat, rules: &[PreparedRule], threshold: f32) ->
             "OpenCV matcher finished template scan"
         );
 
+        scores.insert(rule.target_template.clone(), scan.best_score);
         matches.insert(rule.target_template.clone(), scan.regions);
     }
 
-    Ok(matches)
+    Ok((matches, scores))
 }
 
 /// Loads an image as a non-empty grayscale OpenCV matrix.

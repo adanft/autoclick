@@ -59,3 +59,51 @@ fn clicks_only_the_first_matching_rule_through_public_api() {
         (0, 20, 25)
     );
 }
+
+/// Collects everything a subscriber writes.
+#[derive(Clone, Default)]
+struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for SharedBuffer {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[test]
+fn log_lines_start_with_a_utc_timestamp() {
+    let buffer = SharedBuffer::default();
+    let subscriber = autoclick::log_format(buffer.clone())
+        .with_ansi(false)
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::warn!("output DP-1 disconnected; waiting for it to return")
+    });
+
+    let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+    // For example `2026-10-06T12:00:00.123456Z  WARN output DP-1 ...`.
+    let (timestamp, rest) = logged.split_once(' ').expect("an empty log line");
+    let date = timestamp.split('T').next().unwrap();
+    assert!(
+        date.len() == 10 && date.as_bytes()[4] == b'-' && timestamp.ends_with('Z'),
+        "no timestamp first: {logged}"
+    );
+    assert_eq!(
+        rest.trim_start(),
+        "WARN output DP-1 disconnected; waiting for it to return\n"
+    );
+}

@@ -37,8 +37,7 @@ pub(crate) fn run_with_io_and_monitors(
         &store.templates_dir(),
         matcher::prepare_rules,
     )?;
-    let mut capture = create_capture_service_with(&monitor.name, CaptureService::connect)?;
-    let mut executor = create_wayland_backend_with(&monitor.name, WaylandPointerBackend::connect)?;
+    let backends = connect_backends(&monitor.name)?;
 
     print!(
         "{}",
@@ -53,10 +52,18 @@ pub(crate) fn run_with_io_and_monitors(
         &selected_config,
         &prepared_rules,
         &monitor,
-        &mut capture,
-        &mut executor,
+        backends,
+        connect_backends,
         shutdown_rx,
     )
+}
+
+/// Connects the screencopy capture and the virtual pointer for `connector`,
+/// both at startup and when the runtime reconnects a returning output.
+fn connect_backends(connector: &str) -> Result<(CaptureService, WaylandPointerBackend)> {
+    let capture = create_capture_service_with(connector, CaptureService::connect)?;
+    let executor = create_wayland_backend_with(connector, WaylandPointerBackend::connect)?;
+    Ok((capture, executor))
 }
 
 /// Resolves the configured monitor name against the current monitor list.

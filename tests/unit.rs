@@ -60,8 +60,9 @@ mod matcher {
     use std::sync::Arc;
 
     pub use engine::{
-        bgr_color_stats, mat_color_stats, scan_all, verify_colors, ColorComparison, ColorStats,
-        MAX_CONTRAST_RATIO, MAX_MEAN_CHANNEL_DELTA, MIN_CONTRAST_RATIO,
+        bgr_color_stats, mat_color_stats, scan_all, scan_all_scored, verify_colors,
+        ColorComparison, ColorRejections, ColorStats, TemplateScores, MAX_CONTRAST_RATIO,
+        MAX_MEAN_CHANNEL_DELTA, MIN_CONTRAST_RATIO,
     };
     pub use prepare::prepare_rules;
 

@@ -1,3 +1,4 @@
+use crate::capture::Disconnect;
 use crate::matcher::{bgr_color_stats, ColorStats};
 use anyhow::{anyhow, bail, Context, Result};
 use opencv::core::{self, Mat, Rect, Vec4b};
@@ -8,18 +9,22 @@ use rustix::io::Errno;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::ErrorKind;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use wayland_client::backend::{ReadEventsGuard, WaylandError};
+use wayland_client::backend::protocol::Message;
+use wayland_client::backend::{Backend, ObjectData, ObjectId, WaylandError};
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
+    wl_display,
     wl_output::{self, WlOutput},
     wl_registry::{self, WlRegistry},
     wl_shm::{Format, WlShm},
     wl_shm_pool::WlShmPool,
 };
-use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_client::{Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
@@ -41,6 +46,18 @@ const OUTPUT_NAME_VERSION: u32 = 4;
 /// forever; two seconds is far beyond any normal frame yet still short enough
 /// that a stalled compositor surfaces as a capture error within one cycle.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Longest a new connection waits for the compositor to describe its globals
+/// and outputs, for this client and the virtual pointer alike.
+///
+/// Discovery is two round trips a healthy compositor answers in milliseconds.
+/// Without a bound, a compositor that accepts the socket but never answers
+/// would hang startup, and every reconnect attempt the runtime makes while it
+/// waits for an output, beyond the reach of a first Ctrl+C. Five seconds is
+/// generous for a compositor still settling after a hotplug. A reconnect
+/// connects both clients one after the other, so against a silent compositor
+/// one attempt can take up to twice this before a first Ctrl+C is seen.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pixel layout of a `wl_shm` frame as announced by the screencopy `buffer` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +247,20 @@ struct ClientState {
     frame: FrameState,
 }
 
+impl ClientState {
+    /// Fails with [`Disconnect::OutputRemoved`] once the compositor has
+    /// withdrawn the selected output.
+    fn ensure_output_present(&self, connector: &str) -> Result<()> {
+        if self.selected_output_removed {
+            return Err(Disconnect::OutputRemoved {
+                connector: connector.into(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
 impl Dispatch<WlRegistry, ()> for ClientState {
     fn event(
         state: &mut Self,
@@ -411,17 +442,32 @@ impl ScreencopyClient {
     }
 
     fn from_connection(connection: Connection, connector: &str) -> Result<Self> {
+        Self::from_connection_within(connection, connector, CONNECT_TIMEOUT)
+    }
+
+    /// [`Self::from_connection`] with discovery bounded by `timeout` instead
+    /// of [`CONNECT_TIMEOUT`].
+    fn from_connection_within(
+        connection: Connection,
+        connector: &str,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let deadline = Instant::now() + timeout;
         let mut event_queue = connection.new_event_queue();
         // Not retained: `wl_registry` has no destroy request.
         connection.display().get_registry(&event_queue.handle(), ());
         let mut state = ClientState::default();
-        event_queue
-            .roundtrip(&mut state)
-            .context("Wayland registry discovery roundtrip failed")?;
+        let failed = |what: &str| {
+            format!(
+                "Wayland {what} discovery roundtrip failed within the {} ms connect deadline",
+                timeout.as_millis()
+            )
+        };
+        sync_roundtrip(&connection, &mut event_queue, &mut state, deadline)
+            .with_context(|| failed("registry"))?;
         // Outputs bound in the first roundtrip announce their names in the second.
-        event_queue
-            .roundtrip(&mut state)
-            .context("Wayland output metadata discovery roundtrip failed")?;
+        sync_roundtrip(&connection, &mut event_queue, &mut state, deadline)
+            .with_context(|| failed("output metadata"))?;
 
         let manager = state.manager.clone().ok_or_else(|| {
             anyhow!("the compositor does not advertise zwlr_screencopy_manager_v1 (wlr-screencopy)")
@@ -463,12 +509,16 @@ impl ScreencopyClient {
     /// Captures the selected output, without the cursor, as a grayscale matrix.
     ///
     /// A failed frame, or one not finished within [`FRAME_TIMEOUT`], is destroyed
-    /// and reported; the next call starts a fresh one.
+    /// and reported; the next call starts a fresh one. A removed output or a
+    /// connection lost on I/O fails with a [`Disconnect`] instead, as soon as
+    /// it is seen, and every later call fails the same way. After a protocol
+    /// error every call fails too, but without a [`Disconnect`].
     pub fn capture(&mut self) -> Result<Mat> {
-        if self.state.selected_output_removed {
-            bail!("Wayland output {} was removed", self.connector);
-        }
         self.captured = None;
+        // A removal the compositor sent since the last capture is still unread:
+        // take it in first so no frame is requested for an output that is gone.
+        self.drain_events()?;
+        self.ensure_output_present()?;
         let deadline = Instant::now() + self.frame_timeout;
         self.next_serial += 1;
         self.state.frame = FrameState::new(self.next_serial);
@@ -480,10 +530,9 @@ impl ScreencopyClient {
         );
         let captured = self.copy_frame(&frame, deadline);
         frame.destroy();
-        let flushed = self
-            .connection
-            .flush()
-            .context("failed to flush the screencopy frame destruction");
+        let flushed = self.connection.flush().map_err(|error| {
+            wayland_failure(error, "failed to flush the screencopy frame destruction")
+        });
         let image = captured?;
         flushed?;
         Ok(image)
@@ -555,57 +604,186 @@ impl ScreencopyClient {
             .context("screencopy shm buffer is unavailable")
     }
 
-    /// Dispatches frame events until `done` holds or `deadline` passes.
-    ///
-    /// `blocking_dispatch` would wait on the socket with no bound, so this
-    /// polls the connection fd with the time left instead.
+    fn ensure_output_present(&self) -> Result<()> {
+        self.state.ensure_output_present(&self.connector)
+    }
+
+    /// Dispatches every event already queued or waiting on the socket,
+    /// without waiting for more.
+    fn drain_events(&mut self) -> Result<()> {
+        let (queue, state) = (&mut self.event_queue, &mut self.state);
+        dispatch_pending(queue, state)?;
+        read_events(queue, Duration::ZERO)?;
+        dispatch_pending(queue, state)
+    }
+
+    /// Dispatches frame events until `done` holds or `deadline` passes, and
+    /// stops at once when the selected output is removed meanwhile.
     fn dispatch_until(
         &mut self,
         deadline: Instant,
         done: impl Fn(&FrameState) -> bool,
     ) -> Result<()> {
-        loop {
-            self.event_queue
-                .dispatch_pending(&mut self.state)
-                .context("Wayland dispatch failed while waiting for a screencopy frame")?;
-            if done(&self.state.frame) {
-                return Ok(());
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                bail!(
-                    "screencopy frame for output {} did not complete within {} ms",
-                    self.connector,
-                    self.frame_timeout.as_millis()
-                );
-            }
-            self.event_queue
-                .flush()
-                .context("failed to flush screencopy requests")?;
-            // `None` means events are already queued: dispatch them first.
-            if let Some(guard) = self.event_queue.prepare_read() {
-                if wait_readable(&guard, remaining)? {
-                    match guard.read() {
-                        Ok(_) => {}
-                        Err(WaylandError::Io(error)) if error.kind() == ErrorKind::WouldBlock => {}
-                        Err(error) => {
-                            return Err(error)
-                                .context("failed to read Wayland events for a screencopy frame")
-                        }
-                    }
-                }
-            }
+        let connector = &self.connector;
+        let completed =
+            dispatch_until_deadline(&mut self.event_queue, &mut self.state, deadline, |state| {
+                // Checked before `done`: a `ready` queued behind the removal is
+                // a frame of an output that no longer exists.
+                state.ensure_output_present(connector)?;
+                Ok(done(&state.frame))
+            })?;
+        if !completed {
+            bail!(
+                "screencopy frame for output {} did not complete within {} ms",
+                self.connector,
+                self.frame_timeout.as_millis()
+            );
+        }
+        Ok(())
+    }
+}
+
+// Deadline-bounded Wayland transport, shared with the virtual pointer.
+//
+// `EventQueue::roundtrip` and `blocking_dispatch` wait on the socket with no
+// bound, so a compositor that stops answering would block the monitor loop,
+// and with it shutdown, forever. These helpers poll the connection fd with the
+// time left instead.
+
+/// Tags a failed Wayland call by its cause.
+///
+/// An I/O failure, such as the compositor closing the socket (EOF, `EPIPE`,
+/// `ECONNRESET`), means the link is gone: it carries
+/// [`Disconnect::ConnectionLost`] so the runtime rebuilds both clients. A
+/// protocol error does not: the compositor killed the client over one of its
+/// own requests, so a new client would only repeat it, and the failure must
+/// stay an ordinary one.
+pub(crate) fn wayland_failure(error: WaylandError, action: &'static str) -> anyhow::Error {
+    match error {
+        WaylandError::Io(_) => anyhow::Error::new(error)
+            .context(Disconnect::ConnectionLost)
+            .context(action),
+        WaylandError::Protocol(_) => anyhow::Error::new(error).context(action),
+    }
+}
+
+/// [`wayland_failure`] for a failed dispatch: a malformed message is a
+/// protocol fault, a backend failure is tagged by its own cause.
+pub(crate) fn dispatch_failure(error: DispatchError, action: &'static str) -> anyhow::Error {
+    match error {
+        DispatchError::Backend(error) => wayland_failure(error, action),
+        bad_message @ DispatchError::BadMessage { .. } => {
+            anyhow::Error::new(bad_message).context(action)
         }
     }
+}
+
+/// Dispatches the events already in `queue`.
+fn dispatch_pending<S>(queue: &mut EventQueue<S>, state: &mut S) -> Result<()> {
+    queue
+        .dispatch_pending(state)
+        .map(|_| ())
+        .map_err(|error| dispatch_failure(error, "Wayland dispatch failed"))
+}
+
+/// Reads into `queue` the events that arrive within `timeout`.
+fn read_events<S>(queue: &EventQueue<S>, timeout: Duration) -> Result<()> {
+    // `None` means events are already queued: the caller dispatches them first.
+    let Some(guard) = queue.prepare_read() else {
+        return Ok(());
+    };
+    if !wait_readable(guard.connection_fd(), timeout)? {
+        return Ok(());
+    }
+    match guard.read() {
+        Ok(_) => Ok(()),
+        Err(WaylandError::Io(error)) if error.kind() == ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(wayland_failure(error, "failed to read Wayland events")),
+    }
+}
+
+/// Dispatches `queue` until `done` holds or `deadline` passes, returning
+/// whether `done` held. An error from `done` ends the wait with that error.
+pub(crate) fn dispatch_until_deadline<S>(
+    queue: &mut EventQueue<S>,
+    state: &mut S,
+    deadline: Instant,
+    mut done: impl FnMut(&S) -> Result<bool>,
+) -> Result<bool> {
+    loop {
+        dispatch_pending(queue, state)?;
+        if done(state)? {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        queue
+            .flush()
+            .map_err(|error| wayland_failure(error, "failed to flush Wayland requests"))?;
+        read_events(queue, remaining)?;
+    }
+}
+
+/// Round-trips once: sends `wl_display.sync` and dispatches `queue` until the
+/// compositor answers it, so every event it sent before is dispatched too.
+///
+/// A compositor that has not answered by `deadline` fails with
+/// [`Disconnect::Unresponsive`].
+pub(crate) fn sync_roundtrip<S>(
+    connection: &Connection,
+    queue: &mut EventQueue<S>,
+    state: &mut S,
+    deadline: Instant,
+) -> Result<()> {
+    let answered = Arc::new(SyncAnswered::default());
+    connection
+        .send_request(
+            &connection.display(),
+            wl_display::Request::Sync {},
+            Some(answered.clone()),
+        )
+        .map_err(|error| match connection.backend().last_error() {
+            // A connection that already failed is tagged by that failure.
+            Some(failure) => wayland_failure(failure, "failed to send a Wayland sync request"),
+            None => anyhow!(error).context("failed to send a Wayland sync request"),
+        })?;
+    let completed = dispatch_until_deadline(queue, state, deadline, |_| {
+        Ok(answered.0.load(Ordering::Acquire))
+    })?;
+    if !completed {
+        return Err(Disconnect::Unresponsive.into());
+    }
+    Ok(())
+}
+
+/// `wl_callback` data of one `wl_display.sync`: records the answer.
+///
+/// The backend calls it while reading the socket, ahead of dispatching the
+/// queued events that arrived with or before it.
+#[derive(Default)]
+struct SyncAnswered(AtomicBool);
+
+impl ObjectData for SyncAnswered {
+    fn event(
+        self: Arc<Self>,
+        _: &Backend,
+        _: Message<ObjectId, OwnedFd>,
+    ) -> Option<Arc<dyn ObjectData>> {
+        self.0.store(true, Ordering::Release);
+        None
+    }
+
+    fn destroyed(&self, _: ObjectId) {}
 }
 
 /// Waits until the connection fd is readable or `timeout` elapses, returning
 /// whether it became readable. An interrupted wait reports not readable so the
 /// caller rechecks its deadline.
-fn wait_readable(guard: &ReadEventsGuard, timeout: Duration) -> Result<bool> {
-    let fd = guard.connection_fd();
+fn wait_readable(fd: impl AsFd, timeout: Duration) -> Result<bool> {
     let mut fds = [PollFd::new(&fd, PollFlags::IN | PollFlags::ERR)];
-    let timeout = Timespec::try_from(timeout).context("screencopy timeout out of range")?;
+    let timeout = Timespec::try_from(timeout).context("Wayland poll timeout out of range")?;
     match rustix::event::poll(&mut fds, Some(&timeout)) {
         Ok(ready) => Ok(ready > 0),
         Err(Errno::INTR) => Ok(false),
@@ -614,14 +792,15 @@ fn wait_readable(guard: &ReadEventsGuard, timeout: Duration) -> Result<bool> {
 }
 
 impl Drop for ScreencopyClient {
-    /// Releases the shm buffer and the manager on shutdown.
+    /// Releases the shm buffer and the manager, at shutdown or when the
+    /// runtime replaces a disconnected client.
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
             buffer.destroy();
         }
         self.manager.destroy();
         if let Err(error) = self.connection.flush() {
-            tracing::warn!(error = %error, "Wayland screencopy cleanup failed during shutdown");
+            tracing::warn!(error = %error, "Wayland screencopy cleanup failed while closing");
         }
     }
 }

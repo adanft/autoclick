@@ -268,6 +268,15 @@
             Failed,
             /// Never answers the copy, like a stalled compositor.
             Silent,
+            /// Fails the frame as soon as it is requested, before offering
+            /// any buffer, so the client never sends `copy`.
+            FailedBeforeOffer,
+            /// Removes the captured output's global while answering the
+            /// copy, then completes the frame (`ready`) or never answers it.
+            RemovedDuringCopy { ready: bool },
+            /// Kills the client with a protocol error on the frame as soon as
+            /// it is requested.
+            ProtocolError,
         }
 
         pub struct Scenario {
@@ -304,7 +313,24 @@
             pixels: Vec<u8>,
             offers: VecDeque<Vec<ServerFormat>>,
             replies: VecDeque<Reply>,
+            outputs: Vec<(&'static str, GlobalId)>,
             report: Report,
+        }
+
+        impl ServerState {
+            /// Writes the scripted pixels into `buffer` and completes `frame`.
+            fn complete(&self, frame: &ZwlrScreencopyFrameV1, buffer: &WlBuffer, y_invert: bool) {
+                let data = buffer.data::<BufferData>().unwrap();
+                data.file
+                    .write_all_at(&self.pixels, data.offset as u64)
+                    .unwrap();
+                frame.flags(if y_invert {
+                    zwlr_screencopy_frame_v1::Flags::YInvert
+                } else {
+                    zwlr_screencopy_frame_v1::Flags::empty()
+                });
+                frame.ready(0, 0, 0);
+            }
         }
 
         enum Command {
@@ -427,6 +453,19 @@
                     state.report.captured_outputs.push(name.into());
                     state.report.overlay_cursors.push(overlay_cursor);
                     let frame = data_init.init(frame, ());
+                    match state.replies.front() {
+                        Some(Reply::FailedBeforeOffer) => {
+                            state.replies.pop_front();
+                            frame.failed();
+                            return;
+                        }
+                        Some(Reply::ProtocolError) => {
+                            state.replies.pop_front();
+                            frame.post_error(0_u32, "scripted protocol error");
+                            return;
+                        }
+                        _ => {}
+                    }
                     let has_buffer_done = frame.version() >= 3;
                     if has_buffer_done {
                         // A dmabuf offer first: the client must skip it for the shm one.
@@ -452,7 +491,7 @@
                 frame: &ZwlrScreencopyFrameV1,
                 request: zwlr_screencopy_frame_v1::Request,
                 _: &(),
-                _: &DisplayHandle,
+                handle: &DisplayHandle,
                 _: &mut DataInit<'_, Self>,
             ) {
                 match request {
@@ -460,19 +499,25 @@
                         state.report.copies += 1;
                         match state.replies.pop_front() {
                             Some(Reply::Ready { y_invert }) => {
-                                let data = buffer.data::<BufferData>().unwrap();
-                                data.file
-                                    .write_all_at(&state.pixels, data.offset as u64)
+                                state.complete(frame, &buffer, y_invert)
+                            }
+                            Some(Reply::RemovedDuringCopy { ready }) => {
+                                let captured = state.report.captured_outputs.last().unwrap();
+                                let (_, id) = state
+                                    .outputs
+                                    .iter()
+                                    .find(|(name, _)| name == captured)
                                     .unwrap();
-                                frame.flags(if y_invert {
-                                    zwlr_screencopy_frame_v1::Flags::YInvert
-                                } else {
-                                    zwlr_screencopy_frame_v1::Flags::empty()
-                                });
-                                frame.ready(0, 0, 0);
+                                handle.clone().remove_global::<ServerState>(id.clone());
+                                if ready {
+                                    state.complete(frame, &buffer, false);
+                                }
                             }
                             Some(Reply::Silent) => {}
-                            Some(Reply::Failed) | None => frame.failed(),
+                            Some(Reply::Failed | Reply::FailedBeforeOffer | Reply::ProtocolError)
+                            | None => {
+                                frame.failed()
+                            }
                         }
                     }
                     zwlr_screencopy_frame_v1::Request::Destroy => {
@@ -518,6 +563,7 @@
                         pixels: scenario.pixels,
                         offers: scenario.offers.into(),
                         replies: scenario.replies.into(),
+                        outputs: outputs.clone(),
                         report: Report::default(),
                     };
                     loop {
@@ -777,32 +823,189 @@
         }
     }
 
-    #[test]
-    fn removing_the_selected_output_fails_every_later_capture_fast() {
-        let (compositor, connection) =
-            FakeCompositor::spawn(padded_scenario(vec![Reply::Ready { y_invert: false }; 3]));
-        let mut client = ScreencopyClient::from_connection(connection, "HDMI-A-1").unwrap();
-        client.capture().unwrap();
+    /// Asserts `error` is the typed removal of HDMI-A-1 and came within a
+    /// quarter of the frame timeout.
+    fn assert_removed_fast(error: &anyhow::Error, waited: std::time::Duration, case: &str) {
+        assert_eq!(
+            Disconnect::find(error),
+            Some(&Disconnect::OutputRemoved {
+                connector: "HDMI-A-1".into()
+            }),
+            "{case}: unexpected error: {error:#}"
+        );
+        assert_eq!(error.to_string(), "Wayland output HDMI-A-1 was removed");
+        assert!(waited < FRAME_TIMEOUT / 4, "{case}: failed after {waited:?}");
+    }
 
-        compositor.remove_output("HDMI-A-1");
+    #[test]
+    fn the_first_capture_after_removal_fails_fast_without_any_settling() {
+        // The runtime never settles between cycles: the `global_remove` is only
+        // on the socket when the next capture starts. Whatever the compositor
+        // would answer for the removed output, no frame may come back.
+        for reply in [Reply::Silent, Reply::Ready { y_invert: false }] {
+            let (compositor, connection) = FakeCompositor::spawn(padded_scenario(vec![
+                Reply::Ready { y_invert: false },
+                reply,
+            ]));
+            let mut client = ScreencopyClient::from_connection(connection, "HDMI-A-1").unwrap();
+            client.capture().unwrap();
+
+            compositor.remove_output("HDMI-A-1");
+            for attempt in 1..=2 {
+                let started = std::time::Instant::now();
+                let error = client.capture().unwrap_err();
+                assert_removed_fast(&error, started.elapsed(), &format!("attempt {attempt}"));
+            }
+
+            // Settled only to read the report: nothing was requested for the
+            // removed output after its removal.
+            settle(&mut client);
+            let report = compositor.finish();
+            assert_eq!(report.captured_outputs, vec!["HDMI-A-1".to_string()]);
+            assert_eq!((report.copies, report.frames_destroyed), (1, 1));
+        }
+    }
+
+    #[test]
+    fn an_output_removed_while_its_frame_is_in_flight_fails_that_capture_fast() {
+        // The removal arrives during the capture itself, ahead of a `ready`
+        // for the removed output or of no answer at all.
+        for ready in [false, true] {
+            let (compositor, connection) = FakeCompositor::spawn(padded_scenario(vec![
+                Reply::RemovedDuringCopy { ready },
+            ]));
+            let mut client = ScreencopyClient::from_connection(connection, "HDMI-A-1").unwrap();
+
+            for attempt in 1..=2 {
+                let started = std::time::Instant::now();
+                let error = client.capture().unwrap_err();
+                let case = format!("ready {ready}, attempt {attempt}");
+                assert_removed_fast(&error, started.elapsed(), &case);
+            }
+            assert!(client.region_stats(Rect::new(0, 0, 1, 1)).is_err());
+
+            settle(&mut client);
+            let report = compositor.finish();
+            assert_eq!(report.captured_outputs, vec!["HDMI-A-1".to_string()]);
+            assert_eq!((report.copies, report.frames_destroyed), (1, 1));
+        }
+    }
+
+    #[test]
+    fn a_frame_failed_before_any_buffer_offer_fails_fast_and_the_next_succeeds() {
+        let (compositor, connection) = FakeCompositor::spawn(padded_scenario(vec![
+            Reply::FailedBeforeOffer,
+            Reply::Ready { y_invert: false },
+        ]));
+        let mut client = ScreencopyClient::from_connection(connection, "HDMI-A-1").unwrap();
+
+        let started = std::time::Instant::now();
+        let error = client.capture().unwrap_err();
+        let waited = started.elapsed();
+        let recovered = client.capture().unwrap();
         settle(&mut client);
+
+        assert_eq!(
+            error.to_string(),
+            "the compositor failed the screencopy frame before offering a buffer"
+        );
+        assert_eq!(Disconnect::find(&error), None);
+        assert!(waited < FRAME_TIMEOUT / 4, "failed after {waited:?}");
+        assert_eq!(
+            gray_rows(&recovered),
+            vec![TOP_ROW.to_vec(), BOTTOM_ROW.to_vec()]
+        );
+        // The failed frame is destroyed without ever being copied.
+        let report = compositor.finish();
+        assert_eq!((report.pools, report.copies, report.frames_destroyed), (1, 1, 2));
+    }
+
+    #[test]
+    fn a_protocol_error_fails_captures_without_reporting_a_disconnect() {
+        // The compositor kills the client, but the cause is this client's own
+        // request: rebuilding at once would only repeat it, so it must reach
+        // the runtime as an ordinary failure, not as a lost connection.
+        let (compositor, connection) = FakeCompositor::spawn(padded_scenario(vec![
+            Reply::ProtocolError,
+        ]));
+        let mut client = ScreencopyClient::from_connection(connection, "HDMI-A-1").unwrap();
 
         for attempt in 1..=2 {
-            let started = std::time::Instant::now();
             let error = client.capture().unwrap_err();
-            let waited = started.elapsed();
-
-            assert_eq!(error.to_string(), "Wayland output HDMI-A-1 was removed");
+            assert_eq!(Disconnect::find(&error), None, "attempt {attempt}: {error:#}");
             assert!(
-                waited < client.frame_timeout / 4,
-                "attempt {attempt} failed after {waited:?}"
+                format!("{error:#}").contains("scripted protocol error"),
+                "attempt {attempt}: unexpected error: {error:#}"
             );
         }
-        settle(&mut client);
-        // Nothing is requested for the removed output after its removal.
-        let report = compositor.finish();
-        assert_eq!(report.captured_outputs, vec!["HDMI-A-1".to_string()]);
-        assert_eq!((report.copies, report.frames_destroyed), (1, 1));
+        compositor.finish();
+    }
+
+    #[test]
+    fn a_compositor_closing_its_socket_is_a_lost_connection_through_the_capture_service() {
+        let (compositor, connection) =
+            FakeCompositor::spawn(padded_scenario(vec![Reply::Ready { y_invert: false }; 2]));
+        let client = ScreencopyClient::from_connection(connection, "HDMI-A-1").unwrap();
+        let mut service = crate::capture::CaptureService::with_source("HDMI-A-1", client);
+        service.capture_monitor().unwrap();
+
+        // Stopping the fake drops its display, which closes the server socket.
+        compositor.finish();
+        let started = std::time::Instant::now();
+        let error = service.capture_monitor().unwrap_err();
+
+        assert_eq!(
+            Disconnect::find(&error),
+            Some(&Disconnect::ConnectionLost),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").starts_with("failed to capture output HDMI-A-1: "),
+            "unexpected error: {error:#}"
+        );
+        assert!(started.elapsed() < FRAME_TIMEOUT / 4, "failed after {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn connecting_to_a_compositor_that_never_answers_fails_within_the_deadline() {
+        // The far end of the socket is held open but never read.
+        let (client, _silent) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(client).unwrap();
+        let timeout = std::time::Duration::from_millis(100);
+
+        let started = std::time::Instant::now();
+        let error = ScreencopyClient::from_connection_within(connection, "HDMI-A-1", timeout)
+            .err()
+            .unwrap();
+        let waited = started.elapsed();
+
+        assert_eq!(
+            format!("{error:#}"),
+            "Wayland registry discovery roundtrip failed within the 100 ms connect deadline: \
+             the Wayland compositor stopped answering"
+        );
+        assert!(
+            waited >= timeout && waited < std::time::Duration::from_secs(1),
+            "failed after {waited:?}"
+        );
+    }
+
+    #[test]
+    fn connect_rejects_a_connector_two_outputs_share() {
+        let (compositor, connection) = FakeCompositor::spawn(Scenario {
+            outputs: vec!["HDMI-A-1", "DP-1", "HDMI-A-1"],
+            ..padded_scenario(Vec::new())
+        });
+
+        let error = ScreencopyClient::from_connection(connection, "HDMI-A-1")
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "configured connector HDMI-A-1 is ambiguous: 2 Wayland outputs match"
+        );
+        compositor.finish();
     }
 
     #[test]

@@ -4,6 +4,46 @@ use crate::wayland_pointer::ImageExtent;
 use anyhow::{bail, Context, Result};
 use opencv::core::{Mat, Rect};
 use opencv::prelude::*;
+use std::fmt;
+
+/// A capture or click failure caused by losing the output or the compositor
+/// link behind it, rather than by one bad frame or click.
+///
+/// Neither Wayland client can recover from it in place: a returning output is
+/// a new `wl_output` global and a failed connection stays failed. It travels
+/// in the `anyhow` chain of the failure so the runtime can recognize it with
+/// [`Disconnect::find`] and rebuild both clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Disconnect {
+    /// The compositor withdrew the selected output's `wl_output` global.
+    OutputRemoved { connector: String },
+    /// The Wayland connection failed and cannot be used again.
+    ConnectionLost,
+    /// The compositor did not answer a round trip within its deadline, so
+    /// the connection can no longer be trusted to deliver anything.
+    Unresponsive,
+}
+
+impl Disconnect {
+    /// The disconnect anywhere in `error`'s context chain, if it has one.
+    pub fn find(error: &anyhow::Error) -> Option<&Self> {
+        error.downcast_ref()
+    }
+}
+
+impl fmt::Display for Disconnect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutputRemoved { connector } => {
+                write!(f, "Wayland output {connector} was removed")
+            }
+            Self::ConnectionLost => f.write_str("the Wayland connection was lost"),
+            Self::Unresponsive => f.write_str("the Wayland compositor stopped answering"),
+        }
+    }
+}
+
+impl std::error::Error for Disconnect {}
 
 /// A screenshot proven to have positive dimensions at the capture seam.
 ///

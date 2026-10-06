@@ -14,12 +14,13 @@
     struct Recorder {
         events: Vec<Event>,
         fail_at: Option<&'static str>,
+        output_removed: bool,
     }
 
     impl VirtualPointerPort for Recorder {
         fn begin(&mut self) -> Result<()> {
             self.events.push(Event::Begin);
-            fail_if(self.fail_at, "begin")
+            self.fail_if("begin")
         }
 
         fn motion_absolute(
@@ -31,18 +32,17 @@
             height: u32,
         ) -> Result<()> {
             self.events.push(Event::Motion(time, x, y, width, height));
-            fail_if(self.fail_at, "motion")
+            self.fail_if("motion")
         }
 
         fn frame(&mut self) -> Result<()> {
             self.events.push(Event::Frame);
-            fail_if(self.fail_at, "frame")
+            self.fail_if("frame")
         }
 
         fn left_button(&mut self, time: u32, state: ButtonState) -> Result<()> {
             self.events.push(Event::Button(time, state));
-            fail_if(
-                self.fail_at,
+            self.fail_if(
                 match state {
                     ButtonState::Pressed => "press",
                     ButtonState::Released => "release",
@@ -52,20 +52,30 @@
 
         fn barrier(&mut self) -> Result<()> {
             self.events.push(Event::Barrier);
-            fail_if(self.fail_at, "barrier")
+            self.fail_if("barrier")
         }
 
         fn best_effort_release(&mut self, time: u32) -> Result<()> {
             self.events.push(Event::Cleanup(time));
-            fail_if(self.fail_at, "cleanup")
+            self.fail_if("cleanup")
         }
     }
 
-    fn fail_if(fail_at: Option<&str>, step: &str) -> Result<()> {
-        if fail_at == Some(step) {
+    impl Recorder {
+        /// Fails at the `fail_at` step, with a removed output behind the
+        /// failure when `output_removed` is set.
+        fn fail_if(&self, step: &str) -> Result<()> {
+            if self.fail_at != Some(step) {
+                return Ok(());
+            }
+            if self.output_removed {
+                let removed = crate::capture::Disconnect::OutputRemoved {
+                    connector: "DP-1".into(),
+                };
+                return Err(anyhow::Error::new(removed).context(format!("{step} failpoint")));
+            }
             bail!("{step} failpoint")
         }
-        Ok(())
     }
 
     struct TestClock(VecDeque<u32>);
@@ -463,12 +473,14 @@
         assert_eq!(protocol_substrate::ProtocolSubstrate::LEFT_BUTTON, 0x110);
     }
 
-    #[test]
-    fn generated_client_fails_before_requests_and_closes_idempotently_after_manager_removal() {
+    /// In-process stand-in for a compositor offering one seat, one Normal
+    /// `DP-1` output and a v2 virtual-pointer manager. It records the pointer
+    /// requests it receives and can withdraw the manager or stop answering.
+    mod fake {
         use std::{
             os::unix::net::UnixStream,
             sync::{mpsc, Arc},
-            thread,
+            thread::{self, JoinHandle},
         };
         use wayland_client::Connection;
         use wayland_protocols_wlr::virtual_pointer::v1::server::{
@@ -480,11 +492,16 @@
                 wl_output::{self, WlOutput},
                 wl_seat::WlSeat,
             },
-            Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New,
+            Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource,
         };
 
         #[derive(Default)]
-        struct ServerState(Vec<String>);
+        struct ServerState {
+            requests: Vec<String>,
+            /// Kills the client with a protocol error on its first press.
+            reject_press: bool,
+        }
+
         impl GlobalDispatch<WlSeat, ()> for ServerState {
             fn bind(
                 _: &mut Self,
@@ -566,85 +583,142 @@
             fn request(
                 state: &mut Self,
                 _: &Client,
-                _: &ZwlrVirtualPointerV1,
+                pointer: &ZwlrVirtualPointerV1,
                 request: zwlr_virtual_pointer_v1::Request,
                 _: &(),
                 _: &DisplayHandle,
                 _: &mut DataInit<'_, Self>,
             ) {
                 use zwlr_virtual_pointer_v1::Request::*;
-                state.0.push(
-                    match request {
-                        MotionAbsolute { .. } => "motion",
-                        Frame => "frame",
-                        Button {
-                            state:
-                                wayland_server::WEnum::Value(
-                                    wayland_server::protocol::wl_pointer::ButtonState::Pressed,
-                                ),
-                            ..
-                        } => "press",
-                        Button { .. } => "release",
-                        Destroy => "destroy",
-                        _ => "unexpected",
-                    }
-                    .into(),
-                );
+                let request = match request {
+                    MotionAbsolute { .. } => "motion",
+                    Frame => "frame",
+                    Button {
+                        state:
+                            wayland_server::WEnum::Value(
+                                wayland_server::protocol::wl_pointer::ButtonState::Pressed,
+                            ),
+                        ..
+                    } => "press",
+                    Button { .. } => "release",
+                    Destroy => "destroy",
+                    _ => "unexpected",
+                };
+                if request == "press" && state.reject_press {
+                    pointer.post_error(0_u32, "scripted protocol error");
+                }
+                state.requests.push(request.into());
             }
         }
 
         enum Command {
-            RemoveManager,
+            RemoveManager(mpsc::Sender<()>),
+            /// Stops dispatching and flushing for good, like a hung
+            /// compositor, then acknowledges.
+            Freeze(mpsc::Sender<()>),
             Stop,
         }
 
-        let (client, server) = UnixStream::pair().unwrap();
-        let (done, received) = mpsc::channel();
-        let (command, commands) = mpsc::channel();
-        let (removal_sent, removed) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let mut display = Display::<ServerState>::new().unwrap();
-            let mut handle = display.handle();
-            handle.create_global::<ServerState, WlSeat, _>(1, ());
-            handle.create_global::<ServerState, WlOutput, _>(4, ());
-            let mut manager =
-                Some(handle.create_global::<ServerState, ZwlrVirtualPointerManagerV1, _>(2, ()));
-            server.set_nonblocking(true).unwrap();
-            handle.insert_client(server, Arc::new(())).unwrap();
-            let mut state = ServerState::default();
-            loop {
-                match commands.try_recv() {
-                    Ok(Command::RemoveManager) => {
-                        handle.remove_global::<ServerState>(manager.take().unwrap());
-                        display.flush_clients().unwrap();
-                        removal_sent.send(()).unwrap();
-                    }
-                    Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => break,
-                    Err(mpsc::TryRecvError::Empty) => {}
-                }
-                if display.dispatch_clients(&mut state).is_ok() {
-                    display.flush_clients().unwrap();
-                } else {
-                    thread::yield_now();
-                }
-            }
-            done.send(state.0).unwrap();
-        });
+        pub struct FakeCompositor {
+            commands: mpsc::Sender<Command>,
+            thread: JoinHandle<Vec<String>>,
+        }
 
-        let connection = Connection::from_socket(client).unwrap();
+        impl FakeCompositor {
+            pub fn spawn() -> (Self, Connection) {
+                Self::spawn_with(false)
+            }
+
+            /// A compositor that kills the client with a protocol error on
+            /// its first button press.
+            pub fn rejecting_presses() -> (Self, Connection) {
+                Self::spawn_with(true)
+            }
+
+            fn spawn_with(reject_press: bool) -> (Self, Connection) {
+                let (client, server) = UnixStream::pair().unwrap();
+                let (commands, received) = mpsc::channel();
+                let thread = thread::spawn(move || {
+                    let mut display = Display::<ServerState>::new().unwrap();
+                    let mut handle = display.handle();
+                    handle.create_global::<ServerState, WlSeat, _>(1, ());
+                    handle.create_global::<ServerState, WlOutput, _>(4, ());
+                    let mut manager = Some(
+                        handle.create_global::<ServerState, ZwlrVirtualPointerManagerV1, _>(2, ()),
+                    );
+                    server.set_nonblocking(true).unwrap();
+                    handle.insert_client(server, Arc::new(())).unwrap();
+                    let mut state = ServerState {
+                        reject_press,
+                        ..ServerState::default()
+                    };
+                    let mut frozen = false;
+                    loop {
+                        match received.try_recv() {
+                            Ok(Command::RemoveManager(ack)) => {
+                                handle.remove_global::<ServerState>(manager.take().unwrap());
+                                display.flush_clients().unwrap();
+                                ack.send(()).unwrap();
+                            }
+                            Ok(Command::Freeze(ack)) => {
+                                frozen = true;
+                                ack.send(()).unwrap();
+                            }
+                            Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => break,
+                            Err(mpsc::TryRecvError::Empty) => {}
+                        }
+                        if !frozen && display.dispatch_clients(&mut state).is_ok() {
+                            // A killed client has no socket left to flush.
+                            let _ = display.flush_clients();
+                        } else {
+                            thread::yield_now();
+                        }
+                    }
+                    state.requests
+                });
+                (Self { commands, thread }, Connection::from_socket(client).unwrap())
+            }
+
+            fn acknowledged(&self, command: impl FnOnce(mpsc::Sender<()>) -> Command) {
+                let (ack, acked) = mpsc::channel();
+                self.commands.send(command(ack)).unwrap();
+                acked.recv().unwrap();
+            }
+
+            /// Withdraws the manager global and returns once the client has
+            /// been sent `global_remove`.
+            pub fn remove_manager(&self) {
+                self.acknowledged(Command::RemoveManager);
+            }
+
+            /// Stops answering anything from now on.
+            pub fn freeze(&self) {
+                self.acknowledged(Command::Freeze);
+            }
+
+            /// Stops the compositor and returns the pointer requests it saw.
+            pub fn finish(self) -> Vec<String> {
+                self.commands.send(Command::Stop).unwrap();
+                self.thread.join().unwrap()
+            }
+        }
+    }
+
+    #[test]
+    fn generated_client_fails_before_requests_and_closes_idempotently_after_manager_removal() {
+        let (compositor, connection) = fake::FakeCompositor::spawn();
         let mut substrate =
             protocol_substrate::ProtocolSubstrate::from_connection(connection, "DP-1").unwrap();
         ClickTransaction::new(&mut substrate, TestClock::new([10, 11, 12]))
             .execute(&valid_click())
             .unwrap();
-        command.send(Command::RemoveManager).unwrap();
-        removed.recv().unwrap();
+        compositor.remove_manager();
         let error = ClickTransaction::new(&mut substrate, TestClock::new([13, 14, 15]))
             .execute(&valid_click())
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("selected discovery object was invalidated"));
+        assert!(format!("{error:#}").contains("selected discovery object was invalidated"));
+        // A removed manager is not a removed output: the runtime stops on it.
+        assert_eq!(crate::capture::Disconnect::find(&error), None);
 
         // `Drop for WaylandPointerBackend` calls `close` unconditionally, so closing
         // must stay safe on this already-degraded connection and after an explicit
@@ -653,12 +727,110 @@
         substrate.close().unwrap();
         substrate.close().unwrap();
 
-        command.send(Command::Stop).unwrap();
         assert_eq!(
-            received.recv().unwrap(),
+            compositor.finish(),
             ["motion", "frame", "press", "frame", "release", "frame", "destroy"]
         );
-        server.join().unwrap();
+    }
+
+    /// Asserts `error` is a stall reported within a few `step_timeout`s.
+    fn assert_stalled(error: &anyhow::Error, waited: std::time::Duration, step: &str) {
+        assert_eq!(
+            crate::capture::Disconnect::find(error),
+            Some(&crate::capture::Disconnect::Unresponsive),
+            "{step}: unexpected error: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains(&format!("virtual-pointer {step} roundtrip failed")),
+            "{step}: unexpected error: {error:#}"
+        );
+        assert!(
+            waited >= STALL_TIMEOUT && waited < std::time::Duration::from_secs(1),
+            "{step}: failed after {waited:?}"
+        );
+    }
+
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+    #[test]
+    fn a_click_whose_begin_gets_no_answer_fails_as_a_stall_within_its_deadline() {
+        let (compositor, connection) = fake::FakeCompositor::spawn();
+        let mut substrate =
+            protocol_substrate::ProtocolSubstrate::from_connection(connection, "DP-1").unwrap();
+        substrate.step_timeout = STALL_TIMEOUT;
+
+        compositor.freeze();
+        let started = std::time::Instant::now();
+        let error = ClickTransaction::new(&mut substrate, TestClock::new([1, 2, 3]))
+            .execute(&valid_click())
+            .unwrap_err();
+
+        assert_stalled(&error, started.elapsed(), "begin");
+        assert!(error.to_string().contains("transaction rejected"), "{error:#}");
+        compositor.finish();
+    }
+
+    #[test]
+    fn a_barrier_that_gets_no_answer_fails_as_a_stall_within_its_deadline() {
+        let (compositor, connection) = fake::FakeCompositor::spawn();
+        let mut substrate =
+            protocol_substrate::ProtocolSubstrate::from_connection(connection, "DP-1").unwrap();
+        substrate.step_timeout = STALL_TIMEOUT;
+        substrate.begin().unwrap();
+        substrate.motion_absolute(1, 9, 4, 10, 5).unwrap();
+        substrate.frame().unwrap();
+
+        compositor.freeze();
+        let started = std::time::Instant::now();
+        let error = substrate.barrier().unwrap_err();
+
+        assert_stalled(&error, started.elapsed(), "barrier");
+        compositor.finish();
+    }
+
+    #[test]
+    fn connecting_to_a_compositor_that_never_answers_fails_within_the_deadline() {
+        // The far end of the socket is held open but never read.
+        let (client, _silent) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = wayland_client::Connection::from_socket(client).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = protocol_substrate::ProtocolSubstrate::from_connection_within(
+            connection,
+            "DP-1",
+            STALL_TIMEOUT,
+        )
+        .err()
+        .unwrap();
+        let waited = started.elapsed();
+
+        assert_eq!(
+            format!("{error:#}"),
+            "Wayland registry discovery roundtrip failed within the 100 ms connect deadline: \
+             the Wayland compositor stopped answering"
+        );
+        assert!(
+            waited >= STALL_TIMEOUT && waited < std::time::Duration::from_secs(1),
+            "failed after {waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_protocol_error_fails_the_click_without_reporting_a_disconnect() {
+        let (compositor, connection) = fake::FakeCompositor::rejecting_presses();
+        let mut substrate =
+            protocol_substrate::ProtocolSubstrate::from_connection(connection, "DP-1").unwrap();
+
+        let error = ClickTransaction::new(&mut substrate, TestClock::new([1, 2, 3, 4]))
+            .execute(&valid_click())
+            .unwrap_err();
+
+        assert_eq!(crate::capture::Disconnect::find(&error), None, "{error:#}");
+        assert!(
+            format!("{error:#}").contains("scripted protocol error"),
+            "unexpected error: {error:#}"
+        );
+        compositor.finish();
     }
 
     #[test]
@@ -707,4 +879,79 @@
             "unexpected error: {error}"
         );
         assert_eq!(transaction.into_port().events, vec![Event::Begin]);
+    }
+
+    #[test]
+    fn removing_the_selected_output_rejects_requests_as_a_disconnect() {
+        let mut adapter = ready_adapter();
+        let mut requests = 0;
+
+        let error = protocol_substrate::semantic_request(
+            &mut adapter,
+            |state| {
+                state.output_removed(1);
+                Ok(())
+            },
+            || {
+                requests += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            crate::capture::Disconnect::find(&error),
+            Some(&crate::capture::Disconnect::OutputRemoved {
+                connector: "DP-1".into()
+            })
+        );
+        assert_eq!(error.to_string(), "selected discovery object was invalidated");
+        assert_eq!(requests, 0);
+    }
+
+    #[test]
+    fn losing_another_selected_object_is_not_an_output_disconnect() {
+        let mut seat = ready_adapter();
+        seat.seat_removed(7);
+        let mut other_output = ready_adapter();
+        other_output.output_name(2, "HDMI-A-1");
+        other_output.output_removed(2);
+
+        let seat_error =
+            protocol_substrate::semantic_request(&mut seat, |_| Ok(()), || Ok(())).unwrap_err();
+        let other_output_result =
+            protocol_substrate::semantic_request(&mut other_output, |_| Ok(()), || Ok(()));
+
+        assert_eq!(crate::capture::Disconnect::find(&seat_error), None);
+        assert!(other_output_result.is_ok());
+    }
+
+    #[test]
+    fn a_click_keeps_the_disconnect_behind_a_rejected_or_failed_transaction() {
+        for (step, after_press) in [("begin", false), ("barrier", true)] {
+            let mut transaction = ClickTransaction::new(
+                Recorder {
+                    fail_at: Some(step),
+                    output_removed: true,
+                    ..Recorder::default()
+                },
+                TestClock::new([1, 2, 3, 4]),
+            );
+
+            let error = transaction.execute(&valid_click()).unwrap_err();
+
+            assert_eq!(
+                crate::capture::Disconnect::find(&error),
+                Some(&crate::capture::Disconnect::OutputRemoved {
+                    connector: "DP-1".into()
+                }),
+                "{step}: unexpected error: {error:#}"
+            );
+            assert!(
+                format!("{error:#}").contains(&format!("{step} failpoint")),
+                "{step}: unexpected error: {error:#}"
+            );
+            let cleaned_up = transaction.into_port().events.contains(&Event::Cleanup(4));
+            assert_eq!(cleaned_up, after_press, "{step}");
+        }
     }
