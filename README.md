@@ -66,7 +66,9 @@ sudo ./install.sh         # also works: the build still runs as you, not as root
 ./install.sh --uninstall
 ```
 
-Set `BIN_DIR` to install somewhere else, for example `BIN_DIR=/usr/bin ./install.sh`. The build never runs as root, so `target/` stays owned by you. Running it from a root login, without `sudo`, is refused. It warns when another `autoclick` comes earlier in `PATH`, and when `hyprctl` is missing.
+Set `BIN_DIR` to install somewhere else, for example `BIN_DIR=/usr/bin ./install.sh`. With `sudo`, put it after `sudo` so it survives sudo's environment reset: `sudo BIN_DIR=/usr/bin ./install.sh`. Use the same `BIN_DIR` for `--uninstall`.
+
+The build never runs as root, so `target/` stays owned by you. Installing from a root login, without `sudo`, is refused. After installing it checks your own shell's `PATH`, even under `sudo`, and warns when another `autoclick` comes earlier or when `hyprctl` is missing.
 
 ## First Use
 
